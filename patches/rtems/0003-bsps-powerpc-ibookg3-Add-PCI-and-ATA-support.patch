@@ -1,0 +1,908 @@
+From 1daa762ded4ba2313da15f685208c3b168690f2a Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Thu, 8 Oct 2026 00:05:42 -0700
+Subject: [PATCH 03/15] bsps/powerpc/ibookg3: Add PCI and ATA support
+
+Read the UniNorth host bridge base and the /pci interrupt-map from the
+device tree and implement the shared powerpc PCI configuration space
+interface through the bridge's memory-mapped address and data windows,
+with the slow-latching address register verified by readback. Each
+device's interrupt line register is seeded with its OpenPIC source so
+drivers only need PCI_INTERRUPT_LINE, matching the powermac firmware.
+
+Add a KeyLargo ATA backend for the shared RTEMS IDE/ATA layer. The
+taskfile registers sit 0x10 bytes apart with the device control
+register at 0x160; only the data register is touched as words, which
+also settles the byte order: plain big endian word accesses through the
+guarded window leave the IDENTIFY data in the layout the ATA layer's
+little endian word parsing expects, verified against the drive model
+string. Transfers stay in the firmware's PIO mode; the KeyLargo DMA
+timings are not programmed.
+
+The Open Firmware probe additionally collects the two ata-3 children of
+the mac-io node (bus id, reg offset, interrupt source) and the UniNorth
+base; defaults apply when the device tree is not available.
+---
+ bsps/powerpc/ibookg3/README.md                |   8 +-
+ bsps/powerpc/ibookg3/ata/ide.c                | 300 +++++++++++++++++
+ bsps/powerpc/ibookg3/include/bsp.h            |  44 +++
+ bsps/powerpc/ibookg3/pci/pci.c                | 303 ++++++++++++++++++
+ bsps/powerpc/ibookg3/start/bspstart.c         |  10 +
+ bsps/powerpc/ibookg3/start/ofw.c              |  94 ++++++
+ .../build/bsps/powerpc/ibookg3/bspibookg3.yml |   2 +
+ 7 files changed, 760 insertions(+), 1 deletion(-)
+ create mode 100644 bsps/powerpc/ibookg3/ata/ide.c
+ create mode 100644 bsps/powerpc/ibookg3/pci/pci.c
+
+diff --git a/bsps/powerpc/ibookg3/README.md b/bsps/powerpc/ibookg3/README.md
+index 5515c614b25..f4fc9117aa6 100644
+--- a/bsps/powerpc/ibookg3/README.md
++++ b/bsps/powerpc/ibookg3/README.md
+@@ -8,12 +8,18 @@ UniNorth host bridge, KeyLargo mac-io). It is developed against QEMU's
+ What it uses:
+ 
+ * Open Firmware client interface at boot, to read the CPU, bus and timebase
+-  frequencies, the RAM size and the mac-io base address from the device tree
++  frequencies, the RAM size, the mac-io and UniNorth base addresses and the
++  PCI interrupt map from the device tree
+ * KeyLargo ESCC channel A (Z85C30) as a polled console
+ * decrementer as the clock, timebase as the CPU counter
+ * KeyLargo OpenPIC for external interrupts, with the generic interrupt
+   controller API (enable, disable, priorities, pending state); handlers may
+   be preempted by interrupts of higher priority
++* UniNorth PCI host bridge configuration space access, with each device's
++  interrupt line register seeded from the device tree interrupt map
++* KeyLargo ATA (IDE) through the shared RTEMS ATA layer, PIO programmed I/O;
++  the driver provides `/dev/ideN` controller nodes and `/dev/hdX` block
++  devices that the libblock and DOSFS layers mount
+ * BATs: RAM cached, the mac-io/PCI space at `0x80000000` uncached and guarded
+ 
+ Memory layout: the image is linked to run at 16 MiB (`0x01000000`) with load
+diff --git a/bsps/powerpc/ibookg3/ata/ide.c b/bsps/powerpc/ibookg3/ata/ide.c
+new file mode 100644
+index 00000000000..9e6772a7b86
+--- /dev/null
++++ b/bsps/powerpc/ibookg3/ata/ide.c
+@@ -0,0 +1,300 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++
++/**
++ * @file
++ *
++ * @ingroup RTEMSBSPsPowerPCiBookG3
++ *
++ * @brief KeyLargo ATA controller backend for the shared IDE driver.
++ *
++ * The KeyLargo IDE channels are memory-mapped children of the mac-io
++ * block. Unlike the ISA layout the taskfile registers sit 0x10 bytes
++ * apart, so register index n is at base + 0x10 * n, and the alternate
++ * status and device control register (index 8) sits at base + 0x160.
++ * Only the data register is accessed as words; byte accesses to it are
++ * undefined on this hardware.
++ *
++ * The bridge delivers the registers little endian while the CPU runs
++ * big endian. Plain word loads and stores through the byte-reversing
++ * cache attribute cancel out with the big endian store into the buffer,
++ * leaving the bytes in the same order an x86 host would see, which is
++ * what the shared ATA layer's CF_LE_W() parsing expects. The IDENTIFY
++ * model string is the empirical check of that reasoning.
++ */
++
++/*
++ * Copyright (C) 2026 Erik Gonzalez
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include <bsp.h>
++#include <bsp/irq.h>
++#include <libchip/ide_ctrl.h>
++#include <libchip/ide_ctrl_cfg.h>
++#include <libchip/ide_ctrl_io.h>
++
++#include <rtems/bspIo.h>
++
++/* KeyLargo taskfile register offsets from the channel base */
++#define KEYLARGO_REG(off) ((off) * 0x10)
++#define KEYLARGO_DEVICE_CONTROL 0x160
++
++#define ATA_SECTOR_SIZE (512)
++
++/* Generous busy-wait bound; a reset or seek completes far sooner */
++#define IBOOKG3_IDE_TIMEOUT 10000000
++
++static volatile uint8_t *ibookg3_ide_reg(int minor, int reg)
++{
++  uintptr_t base = ibookg3_ata_base[minor];
++
++  if (reg == IDE_REGISTER_DEVICE_CONTROL_OFFSET) {
++    return (volatile uint8_t *) (base + KEYLARGO_DEVICE_CONTROL);
++  }
++
++  return (volatile uint8_t *) (base + KEYLARGO_REG(reg));
++}
++
++/* Read a taskfile register. Index 0 is the data word. */
++static void ibookg3_ide_ctrl_reg_read(int minor, int reg, uint16_t *value)
++{
++  if (reg == IDE_REGISTER_DATA || reg == IDE_REGISTER_DATA_WORD) {
++    *value = in_be16((volatile uint16_t *) ibookg3_ide_reg(minor, reg));
++    return;
++  }
++
++  if (reg == IDE_REGISTER_DATA_BYTE) {
++    reg = IDE_REGISTER_DATA;
++  }
++
++  *value = in_8(ibookg3_ide_reg(minor, reg));
++}
++
++static void ibookg3_ide_ctrl_reg_write(int minor, int reg, uint16_t value)
++{
++  if (reg == IDE_REGISTER_DATA || reg == IDE_REGISTER_DATA_WORD) {
++    out_be16((volatile uint16_t *) ibookg3_ide_reg(minor, reg), value);
++    return;
++  }
++
++  if (reg == IDE_REGISTER_DATA_BYTE) {
++    reg = IDE_REGISTER_DATA;
++  }
++
++  out_8(ibookg3_ide_reg(minor, reg), (uint8_t) value);
++}
++
++/*
++ * The KeyLargo data register holds the whole sector in one go: poll
++ * DRQ once, then move the words. A transfer that ends without DRQ seen
++ * leaves the request layer to report the status register error.
++ */
++static void ibookg3_ide_read_block(
++  int                        minor,
++  uint32_t                   block_size,
++  rtems_blkdev_sg_buffer    *bufs,
++  uint32_t                  *cbuf,
++  uint32_t                  *pos
++)
++{
++  volatile uint16_t *data;
++  volatile uint8_t *status;
++  uint16_t *lbuf;
++  unsigned int retries;
++  uint32_t cnt;
++
++  status = ibookg3_ide_reg(minor, IDE_REGISTER_STATUS);
++  data = (volatile uint16_t *) ibookg3_ide_reg(minor, IDE_REGISTER_DATA);
++
++  cnt = 0;
++  while (cnt < block_size) {
++    retries = 0;
++    while (!(in_8(status) & IDE_REGISTER_STATUS_DRQ)) {
++      if (++retries > IBOOKG3_IDE_TIMEOUT) {
++        printk(
++          "ide%d: read timed out with DRQ clear, status 0x%02x\n",
++          minor, in_8(status)
++        );
++        return;
++      }
++    }
++
++    lbuf = (uint16_t *)
++      ((uint8_t *) bufs[*cbuf].buffer + *pos);
++    for (int b = 0; b < ATA_SECTOR_SIZE / 2; ++b) {
++      *lbuf = in_be16(data);
++      ++lbuf;
++    }
++
++    cnt += ATA_SECTOR_SIZE;
++    *pos += ATA_SECTOR_SIZE;
++    if (*pos == bufs[*cbuf].length) {
++      *pos = 0;
++      ++(*cbuf);
++    }
++  }
++}
++
++static void ibookg3_ide_write_block(
++  int                        minor,
++  uint32_t                   block_size,
++  rtems_blkdev_sg_buffer    *bufs,
++  uint32_t                  *cbuf,
++  uint32_t                  *pos
++)
++{
++  volatile uint16_t *data;
++  volatile uint8_t *status;
++  uint16_t *lbuf;
++  unsigned int retries;
++  uint32_t cnt;
++
++  status = ibookg3_ide_reg(minor, IDE_REGISTER_STATUS);
++  data = (volatile uint16_t *) ibookg3_ide_reg(minor, IDE_REGISTER_DATA);
++
++  cnt = 0;
++  while (cnt < block_size) {
++    retries = 0;
++    while (!(in_8(status) & IDE_REGISTER_STATUS_DRQ)) {
++      if (++retries > IBOOKG3_IDE_TIMEOUT) {
++        printk(
++          "ide%d: write timed out with DRQ clear, status 0x%02x\n",
++          minor, in_8(status)
++        );
++        return;
++      }
++    }
++
++    lbuf = (uint16_t *)
++      ((uint8_t *) bufs[*cbuf].buffer + *pos);
++    for (int b = 0; b < ATA_SECTOR_SIZE / 2; ++b) {
++      out_be16(data, *lbuf);
++      ++lbuf;
++    }
++
++    cnt += ATA_SECTOR_SIZE;
++    *pos += ATA_SECTOR_SIZE;
++    if (*pos == bufs[*cbuf].length) {
++      *pos = 0;
++      ++(*cbuf);
++    }
++  }
++}
++
++/*
++ * Software reset through the device control register, then wait for the
++ * drive to signal ready. The reset clears the device select, matching
++ * what the shared layer assumes before it probes the units.
++ */
++static void ibookg3_ide_ctrl_initialize(int minor)
++{
++  volatile uint8_t *status;
++  unsigned int retries;
++
++  out_8(ibookg3_ide_reg(minor, IDE_REGISTER_DEVICE_CONTROL_OFFSET),
++        IDE_REGISTER_DEVICE_CONTROL_SRST);
++  for (int i = 0; i < 1000; ++i) {
++    /* The spec asks for at least 10 us of reset pulse */
++  }
++  out_8(ibookg3_ide_reg(minor, IDE_REGISTER_DEVICE_CONTROL_OFFSET),
++        IDE_REGISTER_DEVICE_CONTROL_nIEN);
++
++  status = ibookg3_ide_reg(minor, IDE_REGISTER_STATUS);
++  retries = 0;
++  while (in_8(status) & IDE_REGISTER_STATUS_BSY) {
++    if (++retries > IBOOKG3_IDE_TIMEOUT) {
++      printk("ide%d: software reset did not complete\n", minor);
++      return;
++    }
++  }
++}
++
++static bool ibookg3_ide_ctrl_probe(int minor)
++{
++  return ibookg3_ata_base[minor] != 0;
++}
++
++/*
++ * The shared layer asks the BSP to program transfer timings. The
++ * KeyLargo timing register would need the per-cell values of the
++ * current UniNorth timing set, and QEMU ignores it, so the driver
++ * stays in the firmware's PIO mode and accepts anything the drive
++ * offers that is PIO.
++ */
++static rtems_status_code ibookg3_ide_ctrl_config_io_speed(
++  int      minor,
++  uint16_t modes_available
++)
++{
++  if ((modes_available & ATA_MODES_PIO) == 0) {
++    return RTEMS_NOT_DEFINED;
++  }
++
++  return RTEMS_SUCCESSFUL;
++}
++
++static int ibookg3_ide_ctrl_control(
++  int      minor,
++  uint32_t command,
++  void    *arg
++)
++{
++  return RTEMS_UNSATISFIED;
++}
++
++static ide_ctrl_fns_t ibookg3_ide_ctrl_fns = {
++  .ctrl_probe = ibookg3_ide_ctrl_probe,
++  .ctrl_initialize = ibookg3_ide_ctrl_initialize,
++  .ctrl_control = ibookg3_ide_ctrl_control,
++  .ctrl_reg_read = ibookg3_ide_ctrl_reg_read,
++  .ctrl_reg_write = ibookg3_ide_ctrl_reg_write,
++  .ctrl_read_block = ibookg3_ide_read_block,
++  .ctrl_write_block = ibookg3_ide_write_block,
++  .ctrl_config_io_speed = ibookg3_ide_ctrl_config_io_speed
++};
++
++ide_controller_bsp_table_t IDE_Controller_Table[IBOOKG3_ATA_COUNT] = {
++  {
++    .name = "/dev/ide0",
++    .type = IDE_STD,
++    .fns = &ibookg3_ide_ctrl_fns,
++    .probe = NULL,
++    .status = FALSE,
++    .port1 = 0,
++    .int_driven = FALSE,
++    .int_vec = 0,
++    .params = NULL
++  }, {
++    .name = "/dev/ide1",
++    .type = IDE_STD,
++    .fns = &ibookg3_ide_ctrl_fns,
++    .probe = NULL,
++    .status = FALSE,
++    .port1 = 0,
++    .int_driven = FALSE,
++    .int_vec = 0,
++    .params = NULL
++  }
++};
++
++unsigned long IDE_Controller_Count = IBOOKG3_ATA_COUNT;
+diff --git a/bsps/powerpc/ibookg3/include/bsp.h b/bsps/powerpc/ibookg3/include/bsp.h
+index 09001ae76d9..796e5d24ef7 100644
+--- a/bsps/powerpc/ibookg3/include/bsp.h
++++ b/bsps/powerpc/ibookg3/include/bsp.h
+@@ -65,15 +65,59 @@ extern uint32_t ibookg3_bus_frequency;
+ extern uint32_t ibookg3_cpu_frequency;
+ extern uint32_t ibookg3_memory_size;
+ extern uintptr_t ibookg3_macio_base;
++extern uintptr_t ibookg3_uninorth_base;
++
++/*
++ * KeyLargo ATA controllers, one per bus (primary, secondary). The base
++ * addresses point at the command block relative to ibookg3_macio_base and
++ * the interrupt numbers are KeyLargo OpenPIC sources.
++ */
++#define IBOOKG3_ATA_COUNT 2
++extern uintptr_t ibookg3_ata_base[IBOOKG3_ATA_COUNT];
++extern uint32_t ibookg3_ata_irq[IBOOKG3_ATA_COUNT];
+ 
+ /* KeyLargo (mac-io) register blocks, offsets from ibookg3_macio_base */
+ #define IBOOKG3_MACIO_ESCC_CHA_CTRL 0x13020
+ #define IBOOKG3_MACIO_ESCC_CHA_DATA 0x13030
+ #define IBOOKG3_MACIO_OPENPIC 0x40000
++#define IBOOKG3_MACIO_ATA0 0x20000
++#define IBOOKG3_MACIO_ATA1 0x21000
++
++/*
++ * UniNorth PCI host bridge register blocks, offsets from
++ * ibookg3_uninorth_base.  The config address and data windows are each
++ * 4KiB.
++ */
++#define IBOOKG3_UNINORTH_CFG_ADDR 0x800000
++#define IBOOKG3_UNINORTH_CFG_DATA 0xc00000
+ 
+ /* Used if Open Firmware does not provide the value */
+ #define IBOOKG3_MACIO_BASE_DEFAULT 0x80000000
+ #define IBOOKG3_MEMORY_SIZE_DEFAULT 0x08000000
++#define IBOOKG3_UNINORTH_BASE_DEFAULT 0xf2000000
++#define IBOOKG3_ATA_IRQ_DEFAULT 13
++
++/*
++ * One interrupt-map entry as published under /pci. The bridge maps a
++ * slot and pin to an OpenPIC source; seven device tree cells describe
++ * the address (three), the pin, the parent phandle and the OpenPIC
++ * specifier (source and sense).
++ */
++typedef struct {
++  uint32_t slot;   /* device slot from the address part of the map */
++  uint32_t pin;    /* interrupt pin, 1 = A */
++  uint32_t vector; /* OpenPIC source from the interrupt specifier */
++} ibookg3_pci_map_entry_t;
++
++#define IBOOKG3_PCI_MAP_MAX 16
++#define IBOOKG3_PCI_MAP_CELLS 7
++
++void ibookg3_pci_set_interrupt_map(
++  const ibookg3_pci_map_entry_t *entries,
++  unsigned int count
++);
++
++int ibookg3_pci_route_irq(int bus, int slot, int pin);
+ 
+ /* Called from start.S while Open Firmware is still in control */
+ void ibookg3_ofw_probe(void *ofw_entry);
+diff --git a/bsps/powerpc/ibookg3/pci/pci.c b/bsps/powerpc/ibookg3/pci/pci.c
+new file mode 100644
+index 00000000000..e7f07169055
+--- /dev/null
++++ b/bsps/powerpc/ibookg3/pci/pci.c
+@@ -0,0 +1,303 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++
++/**
++ * @file
++ *
++ * @ingroup RTEMSBSPsPowerPCiBookG3
++ *
++ * @brief UniNorth PCI host bridge configuration space access.
++ *
++ * The UniNorth bridges use a memory-mapped configuration mechanism instead
++ * of the Intel CF8/CFC ports. A 4KiB address register window and a 4KiB
++ * data window sit at fixed offsets from the bridge base, which the
++ * /pci device tree node's reg property provides. Bus zero selects devices
++ * with a one-hot slot bit (CFA0); other buses use an encoding close to the
++ * x86 one with a tag bit (CFA1). The address write must be verified by
++ * reading it back: the bridge latches slowly and returns garbage otherwise.
++ */
++
++/*
++ * Copyright (C) 2026 Erik Gonzalez
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include <bsp.h>
++#include <bsp/irq.h>
++#include <bsp/pci.h>
++
++#include <string.h>
++
++#include <rtems/bspIo.h>
++
++/* Slot 11 holds the UniNorth host bridge itself on bus zero */
++#define UNINORTH_FIRST_DEVICE (11 << 3)
++
++static volatile uint32_t *unin_cfg_addr;
++static volatile uint32_t *unin_cfg_data;
++
++static ibookg3_pci_map_entry_t ibookg3_pci_map[IBOOKG3_PCI_MAP_MAX];
++static unsigned int ibookg3_pci_map_count;
++
++void ibookg3_pci_set_interrupt_map(
++  const ibookg3_pci_map_entry_t *entries,
++  unsigned int count
++)
++{
++  if (count > IBOOKG3_PCI_MAP_MAX) {
++    count = IBOOKG3_PCI_MAP_MAX;
++  }
++
++  memcpy(ibookg3_pci_map, entries, count * sizeof(*entries));
++  ibookg3_pci_map_count = count;
++}
++
++int ibookg3_pci_route_irq(int bus, int slot, int pin)
++{
++  unsigned int i;
++
++  if (pin < 1 || pin > 4) {
++    return -1;
++  }
++
++  for (i = 0; i < ibookg3_pci_map_count; ++i) {
++    if (ibookg3_pci_map[i].slot == (uint32_t) slot &&
++        ibookg3_pci_map[i].pin == (uint32_t) pin) {
++      return (int) ibookg3_pci_map[i].vector;
++    }
++  }
++
++  /*
++   * Pins without an entry in the published map follow the wiring of the
++   * KeyLargo: the four interrupt inputs of the main UniNorth bridge are
++   * OpenPIC sources 27 to 30 and a device rotates through them.
++   */
++  if (bus != 0) {
++    return -1;
++  }
++
++  return 27 + (((pin - 1) + slot) & 3);
++}
++
++/* Build the value for the configuration address register */
++static uint32_t unin_config_reg(
++  unsigned char bus,
++  unsigned char slot,
++  unsigned char function,
++  unsigned char where
++)
++{
++  if (bus == 0) {
++    return (1U << slot) | (function << 8) | (where & 0xfcU);
++  }
++
++  return (bus << 16) | (PCI_DEVFN(slot, function) << 8) | (where & 0xfcU)
++    | 1U;
++}
++
++/*
++ * The bridge windows are little endian; the CPU accesses them with the
++ * byte-reversing loads and stores so that register values land in the
++ * usual PCI byte order.
++ */
++static void unin_set_addr(uint32_t caddr)
++{
++  out_le32(unin_cfg_addr, caddr);
++  while (in_le32(unin_cfg_addr) != caddr) {
++    /* Keep poking until the bridge latches the value */
++  }
++}
++
++static int unin_read(
++  unsigned char bus,
++  unsigned char slot,
++  unsigned char function,
++  unsigned char where,
++  void *val,
++  unsigned int size
++)
++{
++  volatile const uint8_t *data;
++  rtems_interrupt_level level;
++  uint32_t caddr;
++
++  /* Devices on bus zero start at the host bridge in slot 11 */
++  if (bus == 0 && slot < (UNINORTH_FIRST_DEVICE >> 3)) {
++    memset(val, 0xff, size);
++    return PCIB_ERR_SUCCESS;
++  }
++
++  caddr = unin_config_reg(bus, slot, function, where);
++  data = (const volatile uint8_t *) unin_cfg_data + (where & 7U);
++
++  rtems_interrupt_disable(level);
++  unin_set_addr(caddr);
++  switch (size) {
++    case 1:
++      *(uint8_t *) val = in_8(data);
++      break;
++    case 2:
++      *(uint16_t *) val = in_le16((const volatile uint16_t *) data);
++      break;
++    default:
++      *(uint32_t *) val = in_le32((const volatile uint32_t *) data);
++      break;
++  }
++  rtems_interrupt_enable(level);
++
++  return PCIB_ERR_SUCCESS;
++}
++
++static int unin_write(
++  unsigned char bus,
++  unsigned char slot,
++  unsigned char function,
++  unsigned char where,
++  const void *val,
++  unsigned int size
++)
++{
++  volatile uint8_t *data;
++  rtems_interrupt_level level;
++  uint32_t caddr;
++
++  if (bus == 0 && (PCI_DEVFN(slot, function) < UNINORTH_FIRST_DEVICE)) {
++    return PCIB_ERR_NOTPRESENT;
++  }
++
++  caddr = unin_config_reg(bus, slot, function, where);
++  data = (volatile uint8_t *) unin_cfg_data + (where & 7U);
++
++  rtems_interrupt_disable(level);
++  unin_set_addr(caddr);
++  switch (size) {
++    case 1:
++      out_8(data, *(const uint8_t *) val);
++      break;
++    case 2:
++      out_le16((volatile uint16_t *) data, *(const uint16_t *) val);
++      break;
++    default:
++      out_le32((volatile uint32_t *) data, *(const uint32_t *) val);
++      break;
++  }
++  rtems_interrupt_enable(level);
++
++  return PCIB_ERR_SUCCESS;
++}
++
++static int ibookg3_read_config_byte(
++  unsigned char bus, unsigned char slot, unsigned char function,
++  unsigned char where, uint8_t *val
++)
++{
++  return unin_read(bus, slot, function, where, val, 1);
++}
++
++static int ibookg3_read_config_word(
++  unsigned char bus, unsigned char slot, unsigned char function,
++  unsigned char where, uint16_t *val
++)
++{
++  return unin_read(bus, slot, function, where, val, 2);
++}
++
++static int ibookg3_read_config_dword(
++  unsigned char bus, unsigned char slot, unsigned char function,
++  unsigned char where, uint32_t *val
++)
++{
++  return unin_read(bus, slot, function, where, val, 4);
++}
++
++static int ibookg3_write_config_byte(
++  unsigned char bus, unsigned char slot, unsigned char function,
++  unsigned char where, uint8_t val
++)
++{
++  return unin_write(bus, slot, function, where, &val, 1);
++}
++
++static int ibookg3_write_config_word(
++  unsigned char bus, unsigned char slot, unsigned char function,
++  unsigned char where, uint16_t val
++)
++{
++  return unin_write(bus, slot, function, where, &val, 2);
++}
++
++static int ibookg3_write_config_dword(
++  unsigned char bus, unsigned char slot, unsigned char function,
++  unsigned char where, uint32_t val
++)
++{
++  return unin_write(bus, slot, function, where, &val, 4);
++}
++
++static const pci_config_access_functions ibookg3_pci_functions = {
++  .read_config_byte = ibookg3_read_config_byte,
++  .read_config_word = ibookg3_read_config_word,
++  .read_config_dword = ibookg3_read_config_dword,
++  .write_config_byte = ibookg3_write_config_byte,
++  .write_config_word = ibookg3_write_config_word,
++  .write_config_dword = ibookg3_write_config_dword
++};
++
++rtems_pci_config_t BSP_pci_configuration = {
++  .pci_functions = &ibookg3_pci_functions
++};
++
++/*
++ * Seed each device's interrupt line register with its OpenPIC source so
++ * that drivers only have to read PCI_INTERRUPT_LINE, the way the
++ * powermac firmware does.
++ */
++int pci_initialize(void)
++{
++  unsigned char slot;
++
++  unin_cfg_addr = (volatile uint32_t *)
++    (ibookg3_uninorth_base + IBOOKG3_UNINORTH_CFG_ADDR);
++  unin_cfg_data = (volatile uint32_t *)
++    (ibookg3_uninorth_base + IBOOKG3_UNINORTH_CFG_DATA);
++
++  for (slot = 0; slot < PCI_MAX_DEVICES; ++slot) {
++    uint32_t vendor;
++    uint8_t pin;
++    uint8_t line;
++    int vector;
++
++    if (pci_read_config_dword(0, slot, 0, PCI_VENDOR_ID, &vendor)
++        != PCIB_ERR_SUCCESS || vendor == 0xffffffffU) {
++      continue;
++    }
++
++    pci_read_config_byte(0, slot, 0, PCI_INTERRUPT_PIN, &pin);
++    vector = ibookg3_pci_route_irq(0, slot, pin);
++    if (vector >= 0) {
++      line = (uint8_t) vector;
++      pci_write_config_byte(0, slot, 0, PCI_INTERRUPT_LINE, line);
++    }
++  }
++
++  return PCIB_ERR_SUCCESS;
++}
+diff --git a/bsps/powerpc/ibookg3/start/bspstart.c b/bsps/powerpc/ibookg3/start/bspstart.c
+index b2458736b4b..5288071b025 100644
+--- a/bsps/powerpc/ibookg3/start/bspstart.c
++++ b/bsps/powerpc/ibookg3/start/bspstart.c
+@@ -94,6 +94,13 @@ void bsp_start(void)
+   setdbat(0, 0, 0, bat_size(ram_end), _PAGE_RW);
+   setibat(0, 0, 0, bat_size(ram_end), 0);
+   setdbat(1, io, io, 256 * 1024 * 1024, IO_PAGE);
++  setdbat(
++    2,
++    ibookg3_uninorth_base,
++    ibookg3_uninorth_base,
++    16 * 1024 * 1024,
++    IO_PAGE
++  );
+ 
+   _write_MSR(_read_MSR() | MSR_DR | MSR_IR);
+   __asm__ volatile("sync; isync");
+@@ -106,6 +113,9 @@ void bsp_start(void)
+ 
+   bsp_interrupt_initialize();
+ 
++  /* Seed each PCI device's interrupt line with its OpenPIC source */
++  pci_initialize();
++
+   if (ram_end < image_end) {
+     rtems_panic(
+       "iBook G3: %lu MiB RAM is less than the image end at 0x%08lx\n",
+diff --git a/bsps/powerpc/ibookg3/start/ofw.c b/bsps/powerpc/ibookg3/start/ofw.c
+index 30405e3b178..72e034005b1 100644
+--- a/bsps/powerpc/ibookg3/start/ofw.c
++++ b/bsps/powerpc/ibookg3/start/ofw.c
+@@ -46,6 +46,14 @@ uint32_t ibookg3_bus_frequency = 100000000;
+ uint32_t ibookg3_cpu_frequency = 900000000;
+ uint32_t ibookg3_memory_size;
+ uintptr_t ibookg3_macio_base = IBOOKG3_MACIO_BASE_DEFAULT;
++uintptr_t ibookg3_uninorth_base = IBOOKG3_UNINORTH_BASE_DEFAULT;
++uintptr_t ibookg3_ata_base[IBOOKG3_ATA_COUNT] = {
++  IBOOKG3_MACIO_BASE_DEFAULT + IBOOKG3_MACIO_ATA0,
++  IBOOKG3_MACIO_BASE_DEFAULT + IBOOKG3_MACIO_ATA1
++};
++uint32_t ibookg3_ata_irq[IBOOKG3_ATA_COUNT] = {
++  IBOOKG3_ATA_IRQ_DEFAULT, IBOOKG3_ATA_IRQ_DEFAULT + 1
++};
+ 
+ typedef int32_t phandle;
+ 
+@@ -153,6 +161,41 @@ static phandle ofw_find_by_name(phandle node, const char *name)
+   return 0;
+ }
+ 
++/*
++ * The interrupt-map property lists (address, pin, parent, specifier)
++ * tuples of seven cells each. Only the main bridge matters here: its
++ * address cells carry the device slot, its parent is the OpenPIC and
++ * the specifier holds the source number.
++ */
++static void ofw_read_pci_interrupt_map(phandle node)
++{
++  ibookg3_pci_map_entry_t entries[IBOOKG3_PCI_MAP_MAX];
++  uint32_t map[IBOOKG3_PCI_MAP_MAX * IBOOKG3_PCI_MAP_CELLS];
++  unsigned int count;
++  int32_t len;
++
++  len = ofw_getprop(node, "interrupt-map", map, sizeof(map));
++  if (len <= 0) {
++    return;
++  }
++
++  count = (unsigned int) len / (IBOOKG3_PCI_MAP_CELLS * 4);
++  if (count > IBOOKG3_PCI_MAP_MAX) {
++    count = IBOOKG3_PCI_MAP_MAX;
++  }
++
++  for (unsigned int i = 0; i < count; ++i) {
++    const uint32_t *cell = map + i * IBOOKG3_PCI_MAP_CELLS;
++
++    /* The slot is the device number of the devfn byte of phys.hi */
++    entries[i].slot = (cell[0] >> 11) & 0x1f;
++    entries[i].pin = cell[3];
++    entries[i].vector = cell[5];
++  }
++
++  ibookg3_pci_set_interrupt_map(entries, count);
++}
++
+ void ibookg3_ofw_probe(void *ofw_entry)
+ {
+   phandle node;
+@@ -185,9 +228,60 @@ void ibookg3_ofw_probe(void *ofw_entry)
+   /* assigned-addresses: phys.hi, phys.mid, phys.lo, size.hi, size.lo */
+   node = ofw_find_by_name(ofw_peer(0), "mac-io");
+   if (node != 0) {
++    phandle child;
++
+     len = ofw_getprop(node, "assigned-addresses", reg, sizeof(reg));
+     if (len >= 5 * 4) {
+       ibookg3_macio_base = reg[2];
+     }
++
++    /*
++     * The ATA controllers are children of the mac-io node. Their reg is
++     * (offset, size) relative to the mac-io window, the interrupts
++     * property is an OpenPIC source number and sense, and AAPL,bus-id
++     * says which of the two IDE buses it is.
++     */
++    for (child = ofw_child(node); child != 0 && child != -1;
++      child = ofw_peer(child)) {
++      char name[16];
++      int32_t name_len = ofw_getprop(child, "name", name, sizeof(name) - 1);
++      uint32_t bus_id;
++
++      if (name_len != 5 || memcmp(name, "ata-3", 5) != 0) {
++        continue;
++      }
++
++      bus_id = IBOOKG3_ATA_COUNT;
++      ofw_get_u32(child, "AAPL,bus-id", &bus_id);
++      if (bus_id >= IBOOKG3_ATA_COUNT) {
++        continue;
++      }
++
++      len = ofw_getprop(child, "reg", reg, 2 * sizeof(reg[0]));
++      if (len == 2 * (int32_t) sizeof(reg[0])) {
++        ibookg3_ata_base[bus_id] = ibookg3_macio_base + reg[0];
++      }
++
++      len = ofw_getprop(child, "interrupts", reg, sizeof(reg[0]));
++      if (len == (int32_t) sizeof(reg[0])) {
++        ibookg3_ata_irq[bus_id] = reg[0];
++      }
++    }
++  }
++
++  /*
++   * UniNorth PCI host bridge. The /pci alias names the main bus on
++   * NewWorld machines; its reg is the base of the bridge register space
++   * and the configuration address and data windows live at fixed offsets
++   * from it.
++   */
++  node = ofw_finddevice("/pci");
++  if (node != -1) {
++    len = ofw_getprop(node, "reg", reg, sizeof(reg[0]));
++    if (len == (int32_t) sizeof(reg[0])) {
++      ibookg3_uninorth_base = reg[0];
++    }
++
++    ofw_read_pci_interrupt_map(node);
+   }
+ }
+diff --git a/spec/build/bsps/powerpc/ibookg3/bspibookg3.yml b/spec/build/bsps/powerpc/ibookg3/bspibookg3.yml
+index 3da19ad4ab9..6ff32f54140 100644
+--- a/spec/build/bsps/powerpc/ibookg3/bspibookg3.yml
++++ b/spec/build/bsps/powerpc/ibookg3/bspibookg3.yml
+@@ -45,9 +45,11 @@ links:
+ - role: build-dependency
+   uid: ../../bspopts
+ source:
++- bsps/powerpc/ibookg3/ata/ide.c
+ - bsps/powerpc/ibookg3/console/console-escc.c
+ - bsps/powerpc/ibookg3/irq/irq-dispatch.c
+ - bsps/powerpc/ibookg3/irq/irq.c
++- bsps/powerpc/ibookg3/pci/pci.c
+ - bsps/powerpc/ibookg3/start/bspstart.c
+ - bsps/powerpc/ibookg3/start/memory.c
+ - bsps/powerpc/ibookg3/start/ofw.c
+-- 
+2.55.0
+

@@ -1,0 +1,43 @@
+From 5eb90cbbc28f1b03f676afa232c2a1c88745c816 Mon Sep 17 00:00:00 2001
+From: Kinsey Moore <kinsey.moore@oarcorp.com>
+Date: Fri, 26 Dec 2025 12:02:50 -0600
+Subject: [PATCH 11/15] cpukit/sapi/src/interrtext.c: Add missing definition
+
+This adds a missing text description for an internal error and updates
+the spinternalerror02 test to check for the correct end of internal
+error definitions.
+
+(cherry picked from commit 5efed52222b7eea0990c80a460d86462befd7cd8)
+---
+ cpukit/sapi/src/interrtext.c                | 1 +
+ testsuites/sptests/spinternalerror02/init.c | 2 +-
+ 2 files changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/cpukit/sapi/src/interrtext.c b/cpukit/sapi/src/interrtext.c
+index 874b2fdfc17..589abe4c46f 100644
+--- a/cpukit/sapi/src/interrtext.c
++++ b/cpukit/sapi/src/interrtext.c
+@@ -87,6 +87,7 @@ static const char *const internal_error_text[] = {
+   "INTERNAL_ERROR_IDLE_THREAD_CREATE_FAILED",
+   "INTERNAL_ERROR_NO_MEMORY_FOR_IDLE_TASK_STORAGE",
+   "INTERNAL_ERROR_IDLE_THREAD_STACK_TOO_SMALL",
++  "INTERNAL_ERROR_CANNOT_DISABLE_DATA_CACHE",
+   "INTERNAL_ERROR_LIBIO_STDIN_FD_OPEN_FAILED"
+ };
+ 
+diff --git a/testsuites/sptests/spinternalerror02/init.c b/testsuites/sptests/spinternalerror02/init.c
+index 961321cb235..c42c9946d2d 100644
+--- a/testsuites/sptests/spinternalerror02/init.c
++++ b/testsuites/sptests/spinternalerror02/init.c
+@@ -49,7 +49,7 @@ static void test_internal_error_text(void)
+   } while ( text != text_last );
+ 
+   rtems_test_assert(
+-    error - 3 == INTERNAL_ERROR_IDLE_THREAD_STACK_TOO_SMALL
++    error - 3 == INTERNAL_ERROR_LIBIO_STDIN_FD_OPEN_FAILED
+   );
+ }
+ 
+-- 
+2.55.0
+

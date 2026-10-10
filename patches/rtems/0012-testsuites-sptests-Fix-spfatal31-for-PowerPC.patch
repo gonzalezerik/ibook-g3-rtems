@@ -1,0 +1,58 @@
+From 2540b2ca56795742b7f811f6134284dea1f9a818 Mon Sep 17 00:00:00 2001
+From: Sebastian Huber <sebastian.huber@embedded-brains.de>
+Date: Mon, 17 Aug 2026 05:17:44 +0200
+Subject: [PATCH 12/15] testsuites/sptests: Fix spfatal31 for PowerPC
+
+The classic PowerPC exception prologue does not enable the floating
+point unit and saves no floating point context, exactly like the SPARC
+port.  The use of the floating point unit by the timer service routine
+of the test raises a floating point unavailable exception instead of
+the expected fatal error.
+
+Add a branch for this floating point model next to the SPARC one.
+
+Update #5702.
+
+Assisted-by: Claude:claude-opus-5 claude-code
+Signed-off-by: Sebastian Huber <sebastian.huber@embedded-brains.de>
+(cherry picked from commit 3f4199112bad8574188ee0f1d54838d28daaa226)
+---
+ testsuites/sptests/spfatal31/init.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/testsuites/sptests/spfatal31/init.c b/testsuites/sptests/spfatal31/init.c
+index 9d93988628c..a4d4b61687a 100644
+--- a/testsuites/sptests/spfatal31/init.c
++++ b/testsuites/sptests/spfatal31/init.c
+@@ -56,6 +56,28 @@ static bool is_expected_fatal_code( rtems_fatal_code code )
+   return frame->trap == 4;
+ }
+ 
++#elif defined( PPC_HAS_FPU ) && PPC_HAS_FPU == 1 && \
++  !defined( PPC_MULTILIB_FPU )
++
++/*
++ * The classic PowerPC floating point support disables the floating point unit
++ * in exception context and the exception prologue does not save the volatile
++ * floating point context. A use of the floating point unit in interrupt
++ * context raises a floating point unavailable exception.
++ */
++
++#include <bsp/vectors.h>
++
++#define EXPECTED_FATAL_SOURCE RTEMS_FATAL_SOURCE_EXCEPTION
++
++static bool is_expected_fatal_code( rtems_fatal_code code )
++{
++  const rtems_exception_frame *frame;
++
++  frame = (const rtems_exception_frame *) code;
++  return frame->_EXC_number == ASM_FLOAT_VECTOR;
++}
++
+ #endif
+ 
+ static volatile double f = 1.0;
+-- 
+2.55.0
+

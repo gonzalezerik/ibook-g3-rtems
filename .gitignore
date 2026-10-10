@@ -1,0 +1,13 @@
+# created by setup.sh and the build scripts
+/src/
+/rtems/
+/rsb-toolchain-build.log
+/disk/
+# build and run outputs
+*.exe
+*.elf
+*.o
+*.img
+*.iso
+*.log
+__pycache__/

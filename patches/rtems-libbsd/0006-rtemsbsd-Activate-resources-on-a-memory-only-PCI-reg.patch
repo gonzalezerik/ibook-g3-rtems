@@ -1,0 +1,48 @@
+From b60b8d4616371ecce6a035be24f1551bbeae84aa Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Fri, 9 Oct 2026 14:05:29 -0700
+Subject: [PATCH 6/7] rtemsbsd: Activate resources on a memory-only PCI region
+
+A BSP with a PCI memory space but no I/O port space (most embedded
+PCI host bridges, among them UniNorth) defines only
+RTEMS_BSP_PCI_MEM_REGION_BASE.  The default definition of that macro
+was placed before the resource activation gate, so the gate never saw
+a BSP-only definition and bus_activate_resource stayed absent from the
+nexus methods; PCI drivers then got a resource whose bushandle was
+never set to the mapped address.  Move the gate above the default
+definition and accept the memory region base as a selector.
+---
+ rtemsbsd/rtems/rtems-kernel-nexus.c | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/rtemsbsd/rtems/rtems-kernel-nexus.c b/rtemsbsd/rtems/rtems-kernel-nexus.c
+index 273beff0..08ddd186 100644
+--- a/rtemsbsd/rtems/rtems-kernel-nexus.c
++++ b/rtemsbsd/rtems/rtems-kernel-nexus.c
+@@ -84,12 +84,19 @@
+ #define RTEMS_BSP_PCI_IO_REGION_BASE 0
+ #endif
+ 
+-#if !defined(RTEMS_BSP_PCI_MEM_REGION_BASE)
+-#define RTEMS_BSP_PCI_MEM_REGION_BASE 0
++/*
++ * The memory region base also selects resource activation: a BSP with
++ * a PCI memory space but no I/O port space (most embedded PCI host
++ * bridges) only defines RTEMS_BSP_PCI_MEM_REGION_BASE.  Test this
++ * before the default definition below, which would always select it.
++ */
++#if defined(RTEMS_BSP_PCI_IO_REGION_BASE) || \
++    defined(RTEMS_BSP_PCI_MEM_REGION_BASE) || defined(FDT)
++#define ENABLE_RESOURCE_ACTIVATE_DEACTIVATE
+ #endif
+ 
+-#if defined(RTEMS_BSP_PCI_IO_REGION_BASE) || defined(FDT)
+-#define ENABLE_RESOURCE_ACTIVATE_DEACTIVATE
++#if !defined(RTEMS_BSP_PCI_MEM_REGION_BASE)
++#define RTEMS_BSP_PCI_MEM_REGION_BASE 0
+ #endif
+ 
+ RTEMS_BSD_DECLARE_SET(nexus, rtems_bsd_device);
+-- 
+2.55.0
+

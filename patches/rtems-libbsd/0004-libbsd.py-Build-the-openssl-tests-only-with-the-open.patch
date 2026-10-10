@@ -1,0 +1,33 @@
+From b38d254f8ae99b2cad3bac81f9fc1c5297bfbdb5 Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Thu, 8 Oct 2026 21:55:32 -0700
+Subject: [PATCH 4/7] libbsd.py: Build the openssl tests only with the openssl
+ module
+
+The tests link the openssl command and its apps, which need the POSIX
+signal API; BSPs without it cannot link them.  Gate them on the module
+like every other test that depends on one.
+---
+ libbsd.py | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/libbsd.py b/libbsd.py
+index ecd7ec1c..d7a2646d 100644
+--- a/libbsd.py
++++ b/libbsd.py
+@@ -5971,8 +5971,10 @@ class tests(builder.Module):
+                                                      ['test_main'], runTest = False, netTest = True,
+                                                     extraLibs = ['debugger']))
+         self.addTest(mm.generator['test']('crypto01', ['test_main']))
+-        self.addTest(mm.generator['test']('openssl01', ['test_main']))
+-        self.addTest(mm.generator['test']('openssl02', ['test_main']))
++        self.addTest(mm.generator['test']('openssl01', ['test_main'],
++                                          modules = ['usr_bin_openssl']))
++        self.addTest(mm.generator['test']('openssl02', ['test_main'],
++                                          modules = ['usr_bin_openssl']))
+         self.addTest(mm.generator['test']('tcpdump01', ['test_main']))
+         self.addTest(mm.generator['test']('vme01', ['test_main'],
+                                           runTest = False))
+-- 
+2.55.0
+

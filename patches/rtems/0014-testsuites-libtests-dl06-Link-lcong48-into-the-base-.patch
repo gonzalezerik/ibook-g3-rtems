@@ -1,0 +1,56 @@
+From ca3902cc1e54d61a4ef98f002bca82e848f8d0c5 Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Sat, 10 Oct 2026 14:40:17 -0700
+Subject: [PATCH 14/15] testsuites/libtests/dl06: Link lcong48() into the base
+ image
+
+The module calls lcong48().  With a Newlib built with thread-local
+reentrancy, the object file of lcong48() defines the thread-local state
+of the rand48 functions, and a loaded module cannot provide
+thread-local objects, so the load failed with "global symbol not found:
+_tls_rand48_add".  Reference lcong48() from dl-load.c, which is part of
+both the image the module is linked against and the final executable,
+so that the module resolves it in the base image.
+
+Updates #5802
+---
+ testsuites/libtests/dl06/dl-load.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/testsuites/libtests/dl06/dl-load.c b/testsuites/libtests/dl06/dl-load.c
+index 3d44c0efa22..dd9ed63d615 100644
+--- a/testsuites/libtests/dl06/dl-load.c
++++ b/testsuites/libtests/dl06/dl-load.c
+@@ -35,6 +35,18 @@
+ 
+ #include "dl-load.h"
+ 
++#include <stdlib.h>
++
++/*
++ * The module calls lcong48().  With thread-local reentrancy in Newlib, the
++ * object file of lcong48() defines the thread-local state of the rand48
++ * functions, and a loaded module cannot provide thread-local objects.  Link
++ * lcong48() into the base image, so that the module resolves it there.  This
++ * file is part of both the image the module is linked against and the final
++ * executable.
++ */
++void (*volatile dl_load_lcong48)(unsigned short[7]) = lcong48;
++
+ typedef int (*call_t)(int argc, const char* argv[]);
+ 
+ static const char* call_args[] = { "1", "2", "3", "4" };
+@@ -75,6 +87,10 @@ int dl_load_test(void)
+   int    call_ret;
+   int    ret;
+ 
++  /* Keep lcong48() in the base image, see dl_load_lcong48 */
++  if (dl_load_lcong48 == NULL)
++    return 1;
++
+   r1 = dl_load_obj("/dl06.rap");
+   if (!r1)
+     return 1;
+-- 
+2.55.0
+

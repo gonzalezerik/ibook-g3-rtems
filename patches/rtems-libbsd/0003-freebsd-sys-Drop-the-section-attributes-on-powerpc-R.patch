@@ -1,0 +1,48 @@
+From 8b2b38ac21ff41d1af6c6d8292457550a6b0f292 Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Thu, 8 Oct 2026 21:55:32 -0700
+Subject: [PATCH 3/7] freebsd/sys: Drop the section attributes on powerpc RTEMS
+ builds
+
+The powerpc EABI builds use -msdata=sysv: the compiler reaches small
+globals through the small data register and emits R_PPC_SDAREL16 for
+them.  The linker rejects that relocation when the symbol definition
+sits in one of the sections below, so every read-mostly or
+read-frequently global referenced from a small-data access breaks the
+link.  The macros are layout hints only, so define them away for
+__rtems__ and let the variables land in the ordinary data sections.
+---
+ freebsd/sys/sys/systm.h | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/freebsd/sys/sys/systm.h b/freebsd/sys/sys/systm.h
+index 34f25049..b0d323fd 100644
+--- a/freebsd/sys/sys/systm.h
++++ b/freebsd/sys/sys/systm.h
+@@ -110,8 +110,23 @@ enum VM_GUEST { VM_GUEST_NO = 0, VM_GUEST_VM, VM_GUEST_XEN, VM_GUEST_HV,
+ /*
+  * Align variables.
+  */
++#ifdef __rtems__
++/*
++ * The powerpc EABI builds use -msdata=sysv: the compiler reaches small
++ * globals through the small data register and emits R_PPC_SDAREL16 for
++ * them, which the linker rejects when the definition sits in a section
++ * outside the small data area.  The macros below are layout hints, so
++ * drop them and let the variables land in the ordinary data sections.
++ */
++#define	__read_mostly
++#define	__read_frequently
++#define	__exclusive_cache_line	__aligned(CACHE_LINE_SIZE)
++#else /* !__rtems__ */
+ #define	__read_mostly		__section(".data.read_mostly")
+ #define	__read_frequently	__section(".data.read_frequently")
++#define	__exclusive_cache_line	__aligned(CACHE_LINE_SIZE) \
++				    __section(".data.exclusive_cache_line")
++#endif /* __rtems__ */
+ #define	__exclusive_cache_line	__aligned(CACHE_LINE_SIZE) \
+ 				    __section(".data.exclusive_cache_line")
+ #if defined(_STANDALONE)
+-- 
+2.55.0
+

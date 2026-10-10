@@ -1,0 +1,73 @@
+From 5053969b861b3a04f526c6406ca418573cdd824a Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Fri, 9 Oct 2026 15:24:06 -0700
+Subject: [PATCH 07/15] bsps/powerpc/ibookg3: Document the frame buffer console
+ and booting
+
+Describe the frame buffer console, the interrupt triggers from the device
+tree and how to link and boot an image through Open Firmware.
+---
+ bsps/powerpc/ibookg3/README.md | 33 +++++++++++++++++++++++++++------
+ 1 file changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/bsps/powerpc/ibookg3/README.md b/bsps/powerpc/ibookg3/README.md
+index 2e0ed1a653e..b20cb481931 100644
+--- a/bsps/powerpc/ibookg3/README.md
++++ b/bsps/powerpc/ibookg3/README.md
+@@ -8,9 +8,13 @@ UniNorth host bridge, KeyLargo mac-io). It is developed against QEMU's
+ What it uses:
+ 
+ * Open Firmware client interface at boot, to read the CPU, bus and timebase
+-  frequencies, the RAM size, the mac-io and UniNorth base addresses and the
+-  PCI interrupt map from the device tree
+-* KeyLargo ESCC channel A (Z85C30) as a polled console
++  frequencies, the RAM size, the mac-io and UniNorth base addresses, the
++  PCI interrupt map, the trigger (level or edge) of each OpenPIC source and
++  the display from the device tree
++* KeyLargo ESCC channel A (Z85C30) as a polled console, and the same output
++  as text (8x16 font) on the frame buffer Open Firmware set up; 8, 16 and
++  32-bit displays, with two palette entries set through Open Firmware on
++  8-bit ones
+ * decrementer as the clock, timebase as the CPU counter
+ * KeyLargo OpenPIC for external interrupts, with the generic interrupt
+   controller API (enable, disable, priorities, pending state); handlers may
+@@ -62,6 +66,20 @@ Interrupt vectors
+   Test 27 and the validation tests use the first two)
+ * 68: decrementer
+ 
++Booting through Open Firmware
++-----------------------------
++
++QEMU's `-kernel` loader places a segment at its load address plus 16 MiB,
++so the default link uses load addresses starting at zero. Open Firmware
++loads an ELF image at its load addresses; link images for it with
++
++```shell
++-Wl,--defsym=IBOOKG3_LOAD_BASE=0x01000000
++```
++
++and put them on an HFS+ volume, for example a CD with an Apple partition
++map, then at the Open Firmware prompt: `boot cd:3,\rtems.elf`.
++
+ Running on QEMU
+ ---------------
+ 
+@@ -80,9 +98,12 @@ configuration of the tester.
+ Limitations
+ -----------
+ 
+-* Only tested on QEMU. Booting on real hardware needs a loader path from
+-  Open Firmware (for example from disk) that places the image at 16 MiB.
+-* No framebuffer console; the real iBook has no external serial port.
++* Only tested on QEMU. Booting through Open Firmware's own ELF loader from
++  a CD (Apple partition map + HFS+) works on QEMU's OpenBIOS; Apple's Open
++  Firmware is not tested.
++* Console input only from the ESCC, which the real iBook does not bring
++  out; the built-in keyboard is on the PMU (not supported), a USB keyboard
++  works through rtems-libbsd.
+ * No PMU support (power off, real-time clock, battery).
+ * The KeyLargo ATA driver runs in PIO mode; DMA modes are untested.
+ * The `gem` driver programs the GMAC through bus-space accesses and the
+-- 
+2.55.0
+

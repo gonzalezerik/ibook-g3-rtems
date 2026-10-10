@@ -1,0 +1,28 @@
+From 0da48040883ebbd6756cd7f7dfee459bcfe7e70a Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Mon, 5 Oct 2026 14:44:06 -0700
+Subject: [PATCH 2/2] dtc-1-1.cfg: Use the install macro
+
+The DTC Makefile hardcodes INSTALL = /usr/bin/install. Hosts without
+that path, such as NixOS, fail to install. Pass the RSB install tool.
+---
+ source-builder/config/dtc-1-1.cfg | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/source-builder/config/dtc-1-1.cfg b/source-builder/config/dtc-1-1.cfg
+index c27fe03..04032b7 100644
+--- a/source-builder/config/dtc-1-1.cfg
++++ b/source-builder/config/dtc-1-1.cfg
+@@ -57,7 +57,8 @@ URL: 	   https://www.devicetree.org/
+   rm -rf $SB_BUILD_ROOT
+ 
+   cd dtc-%{dtc_version}
+-  %{__make} DESTDIR=$SB_BUILD_ROOT PREFIX=%{_prefix} WARNINGS= install
++  %{__make} DESTDIR=$SB_BUILD_ROOT PREFIX=%{_prefix} WARNINGS= \
++    INSTALL=%{__install} install
+ 
+   cd ${build_top}
+ 
+-- 
+2.55.0
+

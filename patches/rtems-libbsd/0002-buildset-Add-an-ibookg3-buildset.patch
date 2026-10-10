@@ -1,0 +1,45 @@
+From 29420eca71347776d92257dda31eaa55da427cf6 Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Thu, 8 Oct 2026 21:55:20 -0700
+Subject: [PATCH 2/7] buildset: Add an ibookg3 buildset
+
+The iBook G3 is a powerpc machine; the TI and NXP modules of the
+default buildset only compile on their ARM SoC families, where the
+openfirmware include chain resolves.  Turn them off, along with the
+openssl command, which needs a full POSIX signal stack this BSP does
+not provide to the shell application.
+
+Same feature set as the default buildset otherwise: USB and the
+networking stack are on.
+---
+ buildset/ibookg3.ini | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+ create mode 100644 buildset/ibookg3.ini
+
+diff --git a/buildset/ibookg3.ini b/buildset/ibookg3.ini
+new file mode 100644
+index 00000000..218b3c01
+--- /dev/null
++++ b/buildset/ibookg3.ini
+@@ -0,0 +1,18 @@
++#
++# Buildset for the Apple iBook G3 (powerpc, NewWorld, UniNorth PCI).
++#
++# Same feature set as the default buildset, minus the modules that only
++# compile on ARM SoC families; on powerpc they fail in their openfirmware
++# header chain, and they can never attach on this machine anyway.
++#
++
++[general]
++name = ibookg3
++extends = default.ini
++
++[modules]
++dev_usb_controller_bbb = off
++imx = off
++mmc_ti = off
++ti_soc = off
++usr_bin_openssl = off
+-- 
+2.55.0
+

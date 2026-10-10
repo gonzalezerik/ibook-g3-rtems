@@ -1,0 +1,114 @@
+From d343271703187fa1a4efd363890f3cc548177c06 Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Mon, 5 Oct 2026 14:42:41 -0700
+Subject: [PATCH 1/2] sb/linux.py: Add NixOS support
+
+NixOS has no FHS /bin or /usr/bin beyond /bin/sh and /usr/bin/env, so
+the absolute tool paths in defaults.mc do not exist and the generated
+build scripts fail. The tools are on the PATH, for example inside a
+nix-shell, and live under /nix/store, so they cannot be listed as fixed
+paths like the other distribution variations. Resolve the macros that
+default to an absolute path from the PATH instead.
+
+NixOS is detected with the distro module, or by /etc/NIXOS when the
+module is not installed, because its /etc/issue cannot be parsed.
+
+Note that the nixpkgs compiler wrapper enables -Werror=format-security
+by default, which GCC's libcpp does not build with; use a shell with
+hardeningDisable = [ "all" ].
+---
+ source-builder/sb/linux.py | 60 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 59 insertions(+), 1 deletion(-)
+
+diff --git a/source-builder/sb/linux.py b/source-builder/sb/linux.py
+index 33ec1bd..1f2e936 100644
+--- a/source-builder/sb/linux.py
++++ b/source-builder/sb/linux.py
+@@ -26,10 +26,62 @@ import multiprocessing
+ import platform
+ import pprint
+ import os
++import shutil
+ 
+ from . import path
+ from . import log
+ 
++#
++# NixOS has no FHS /bin or /usr/bin beyond /bin/sh and /usr/bin/env. Tools
++# are found on the PATH, for example inside a nix-shell, and live under
++# /nix/store so they cannot be listed as fixed paths. The macros that default
++# to an absolute path are resolved from the PATH instead.
++#
++_nixos_exes = {
++    '__bash': ('optional', 'bash', ''),
++    '__bison': ('required', 'bison', ''),
++    '__bzip2': ('required', 'bzip2', ''),
++    '__cat': ('required', 'cat', ''),
++    '__chgrp': ('required', 'chgrp', ''),
++    '__chmod': ('required', 'chmod', ''),
++    '__chown': ('required', 'chown', ''),
++    '__cmake': ('optional', 'cmake', ''),
++    '__cp': ('required', 'cp', ''),
++    '__cvs': ('optional', 'cvs', ''),
++    '__flex': ('required', 'flex', ''),
++    '__git': ('required', 'git', ''),
++    '__grep': ('required', 'grep', ''),
++    '__gzip': ('required', 'gzip', ''),
++    '__id': ('required', 'id', ''),
++    '__install': ('required', 'install', ''),
++    '__install_info': ('optional', 'install-info', ''),
++    '__ld': ('required', 'ld', ''),
++    '__ldconfig': ('required', 'ldconfig', ''),
++    '__makeinfo': ('optional', 'makeinfo', ''),
++    '__mkdir': ('required', 'mkdir', ''),
++    '__mkdir_p': ('none', 'mkdir', ' -p'),
++    '__mv': ('required', 'mv', ''),
++    '__nm': ('required', 'nm', ''),
++    '__objcopy': ('none', 'objcopy', ''),
++    '__objdump': ('none', 'objdump', ''),
++    '__patch_bin': ('required', 'patch', ''),
++    '__rm': ('required', 'rm', ''),
++    '__sed': ('required', 'sed', ''),
++    '__tar': ('required', 'tar', ''),
++    '__touch': ('required', 'touch', ''),
++    '__unzip': ('required', 'unzip', ''),
++    '__xz': ('required', 'xz', '')
++}
++
++
++def _nixos_defines():
++    defines = {}
++    for macro, (constraint, exe, args) in _nixos_exes.items():
++        exe_path = shutil.which(exe)
++        if exe_path is not None:
++            defines[macro] = ('exe', constraint, exe_path + args)
++    return defines
++
+ 
+ def load():
+     uname = os.uname()
+@@ -121,6 +173,10 @@ def load():
+         except ValueError:
+             pass
+ 
++    # NixOS marks itself with /etc/NIXOS; its /etc/issue is not parsable
++    if distro == '' and path.exists('/etc/NIXOS'):
++        distro = 'nixos'
++
+     # Non LSB - last resort, try issue
+     if distro == '':
+         try:
+@@ -150,7 +206,9 @@ def load():
+         # Versions don't carry over to likes; e.g. linuxmint 21.6 != debian 21.6.
+         distro_ver = 0
+ 
+-    if distro in variations:
++    if distro == 'nixos':
++        defines.update(_nixos_defines())
++    elif distro in variations:
+         for v in variations[distro]:
+             if path.exists(variations[distro][v][2]):
+                 defines[v] = variations[distro][v]
+-- 
+2.55.0
+

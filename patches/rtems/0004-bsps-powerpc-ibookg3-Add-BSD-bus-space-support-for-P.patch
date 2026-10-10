@@ -1,0 +1,103 @@
+From 581147842337ac355ab385fcc80e4ab6eff56558 Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Fri, 9 Oct 2026 13:44:17 -0700
+Subject: [PATCH 04/15] bsps/powerpc/ibookg3: Add BSD bus space support for PCI
+
+The rtems-libbsd nexus bus turns PCI memory resources into bus space
+through two BSP hooks.  RTEMS_BSP_PCI_MEM_REGION_BASE selects resource
+activation for a host bridge whose PCI memory window maps one to one
+into the CPU address map, as UniNorth does on both the QEMU mac99
+machine and the real iBook.  RTEMS_BSP_READ_2/4 and
+RTEMS_BSP_WRITE_2/4 replace the plain big endian accesses of the BSD
+bus space helpers; the PCI address space reaches the CPU byte lanes
+unchanged while the devices are little endian, so every access must
+byte swap, done here with the libcpu io.h little endian accessors.
+
+With these two hooks the FreeBSD gem (UniNorth GMAC) and ohci
+(KeyLargo USB) drivers probe, attach and pass traffic through this
+BSP on QEMU.
+---
+ bsps/powerpc/ibookg3/README.md     | 28 +++++++++++++++++++++++++++-
+ bsps/powerpc/ibookg3/include/bsp.h | 23 +++++++++++++++++++++++
+ 2 files changed, 50 insertions(+), 1 deletion(-)
+
+diff --git a/bsps/powerpc/ibookg3/README.md b/bsps/powerpc/ibookg3/README.md
+index f4fc9117aa6..f5b000a0c4c 100644
+--- a/bsps/powerpc/ibookg3/README.md
++++ b/bsps/powerpc/ibookg3/README.md
+@@ -22,6 +22,30 @@ What it uses:
+   devices that the libblock and DOSFS layers mount
+ * BATs: RAM cached, the mac-io/PCI space at `0x80000000` uncached and guarded
+ 
++Through rtems-libbsd (branch `bsp-ibookg3` of the workbench clone):
++
++* UniNorth GMAC Ethernet (FreeBSD `gem`, `miibus`, `ukphy`)
++* KeyLargo OHCI USB host controller (FreeBSD `ohci` via `ohci_pci`,
++  `usbus`, `ukbd`, `umass`)
++
++PCI MMIO is byte swapped: the BSP defines `RTEMS_BSP_READ_2/4` and
++`RTEMS_BSP_WRITE_2/4` as `in_le16/in_le32/out_le16/out_le32`, which the
++rtems-libbsd bus space uses for every PCI access, because the UniNorth
++bridge reaches the CPU byte lanes unchanged while the devices are little
++endian. `RTEMS_BSP_PCI_MEM_REGION_BASE` is zero (one-to-one mapping),
++which selects BSD bus resource activation for the PCI space.
++
++Notes for QEMU
++--------------
++
++* QEMU's sungem model only performs the software reset side effect on
++  its private `GREG_SWRST` register at offset `0x1010`; the FreeBSD
++  driver's reset write to `GEM_RESET` (`0x0010`) lands in the backing
++  store without resetting, so those bits never self-clear and the
++  driver prints `cannot reset receiver/transmitter` while the device
++  still works. On real hardware `GEM_RESET` self-clears and the
++  messages do not appear.
++
+ Memory layout: the image is linked to run at 16 MiB (`0x01000000`) with load
+ addresses starting at zero, which is what QEMU's `mac99` `-kernel` loader
+ expects. The work area runs from the end of the image to the end of RAM as
+@@ -59,4 +83,6 @@ Limitations
+   Open Firmware (for example from disk) that places the image at 16 MiB.
+ * No framebuffer console; the real iBook has no external serial port.
+ * No PMU support (power off, real-time clock, battery).
+-* No drivers for the other KeyLargo or PCI devices.
++* The KeyLargo ATA driver runs in PIO mode; DMA modes are untested.
++* The `gem` driver programs the GMAC through bus-space accesses and the
++  DMA descriptors in memory; it does not use Apple's DBDMA engine.
+diff --git a/bsps/powerpc/ibookg3/include/bsp.h b/bsps/powerpc/ibookg3/include/bsp.h
+index 796e5d24ef7..f2f2276e9bb 100644
+--- a/bsps/powerpc/ibookg3/include/bsp.h
++++ b/bsps/powerpc/ibookg3/include/bsp.h
+@@ -91,6 +91,29 @@ extern uint32_t ibookg3_ata_irq[IBOOKG3_ATA_COUNT];
+ #define IBOOKG3_UNINORTH_CFG_ADDR 0x800000
+ #define IBOOKG3_UNINORTH_CFG_DATA 0xc00000
+ 
++/*
++ * The UniNorth PCI host bridge maps memory space one to one into the
++ * CPU address map (the QEMU mac99 machine and the real iBook both do),
++ * so the bus region base is zero. This tells the RTEMS BSD nexus bus
++ * to provide resource activation for the PCI space.
++ */
++#define RTEMS_BSP_PCI_MEM_REGION_BASE 0
++
++/*
++ * PCI devices are little endian and the PCI address space reaches the
++ * CPU byte lanes unchanged, so a big endian PowerPC load or store must
++ * byte swap to present a little endian value to the device. The BSD
++ * bus space helpers use these macros for every bus space access.
++ */
++#define RTEMS_BSP_READ_2(_address) \
++  in_le16((const volatile uint16_t *) (_address))
++#define RTEMS_BSP_WRITE_2(_address, _value) \
++  out_le16((volatile uint16_t *) (_address), (_value))
++#define RTEMS_BSP_READ_4(_address) \
++  in_le32((const volatile uint32_t *) (_address))
++#define RTEMS_BSP_WRITE_4(_address, _value) \
++  out_le32((volatile uint32_t *) (_address), (_value))
++
+ /* Used if Open Firmware does not provide the value */
+ #define IBOOKG3_MACIO_BASE_DEFAULT 0x80000000
+ #define IBOOKG3_MEMORY_SIZE_DEFAULT 0x08000000
+-- 
+2.55.0
+

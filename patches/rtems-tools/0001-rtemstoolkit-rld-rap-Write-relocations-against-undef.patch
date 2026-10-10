@@ -1,0 +1,67 @@
+From 1529cdbd2b71e2a4497d8fe914f9c2a5ce1f7b3b Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Sat, 10 Oct 2026 14:40:17 -0700
+Subject: [PATCH] rtemstoolkit/rld-rap: Write relocations against undefined
+ symbols
+
+A relocation record whose symbol has no section was skipped when the
+relocations were written, but it was still counted in the section's
+relocation header.  An undefined symbol has no section, so every
+relocation against a symbol defined in another object or in the base
+image was dropped.  The loader then read the following data as
+relocation records and failed, for example with "global symbol not
+found:" and an empty name.
+
+Skip only relocation records without a symbol, write the ones against
+undefined symbols by name, and count the records which are written.
+---
+ rtemstoolkit/rld-rap.cpp | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/rtemstoolkit/rld-rap.cpp b/rtemstoolkit/rld-rap.cpp
+index 045536a..c9dce51 100644
+--- a/rtemstoolkit/rld-rap.cpp
++++ b/rtemstoolkit/rld-rap.cpp
+@@ -927,6 +927,17 @@ namespace rld
+                         "' not found: " + obj.name ().full (), "rap::object");
+     }
+ 
++    /*
++     * A relocation record without a symbol has nothing to relocate and is not
++     * written. A relocation against an undefined symbol has a symbol section
++     * of 0 as well, but it is written: the loader resolves the symbol by name.
++     */
++    static bool
++    reloc_has_no_symbol (const relocation& reloc)
++    {
++      return reloc.symsect == 0 && reloc.symname.empty ();
++    }
++
+     uint32_t
+     object::get_relocations () const
+     {
+@@ -942,7 +953,11 @@ namespace rld
+       if ((sec < 0) || (sec >= rap_secs))
+         throw rld::error ("Invalid section index '" + rld::to_string (sec),
+                           "rap::relocations");
+-      return secs[sec].relocs.size ();
++      uint32_t relocs = 0;
++      for (const relocation& reloc : secs[sec].relocs)
++        if (!reloc_has_no_symbol (reloc))
++          ++relocs;
++      return relocs;
+     }
+ 
+     void
+@@ -1406,7 +1421,7 @@ namespace rld
+             bool              write_addend = sec.rela;
+             bool              write_symname = false;
+ 
+-            if (reloc.symsect == 0)
++            if (reloc_has_no_symbol (reloc))
+               continue;
+ 
+             offset = sec.offset + reloc.offset;
+-- 
+2.55.0
+

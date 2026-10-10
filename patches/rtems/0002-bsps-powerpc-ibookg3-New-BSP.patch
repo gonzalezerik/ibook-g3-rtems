@@ -1,0 +1,1659 @@
+From 80307b3927b519911f1ddb492477e45030f2cccf Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Mon, 5 Oct 2026 16:10:34 -0700
+Subject: [PATCH 02/15] bsps/powerpc/ibookg3: New BSP
+
+Add a BSP for the Apple iBook G3 (PowerPC 750, NewWorld Open Firmware,
+KeyLargo). It reads the machine description from the Open Firmware
+device tree at boot, uses the KeyLargo ESCC channel A as a polled
+console and the decrementer as the clock. The KeyLargo OpenPIC
+interrupts are dispatched through the generic interrupt support with
+nesting, and the OpenPIC inter-processor interrupts sent to the
+processor itself serve as software interrupts. The work area is sized
+from the RAM reported by Open Firmware.
+
+It runs on QEMU's mac99 machine with -cpu 750cx.
+---
+ bsps/powerpc/ibookg3/README.md                |  56 +++
+ bsps/powerpc/ibookg3/console/console-escc.c   | 109 ++++++
+ bsps/powerpc/ibookg3/include/bsp.h            |  97 ++++++
+ bsps/powerpc/ibookg3/include/bsp/irq.h        |  93 +++++
+ bsps/powerpc/ibookg3/include/tm27.h           |  94 +++++
+ bsps/powerpc/ibookg3/irq/irq-dispatch.c       |  71 ++++
+ bsps/powerpc/ibookg3/irq/irq.c                | 322 ++++++++++++++++++
+ bsps/powerpc/ibookg3/start/bspstart.c         | 126 +++++++
+ bsps/powerpc/ibookg3/start/linkcmds           |  86 +++++
+ bsps/powerpc/ibookg3/start/memory.c           |  73 ++++
+ bsps/powerpc/ibookg3/start/ofw.c              | 193 +++++++++++
+ bsps/powerpc/ibookg3/start/start.S            |  92 +++++
+ spec/build/bsps/powerpc/ibookg3/abi.yml       |  20 ++
+ .../build/bsps/powerpc/ibookg3/bspibookg3.yml |  72 ++++
+ spec/build/bsps/powerpc/ibookg3/start.yml     |  14 +
+ 15 files changed, 1518 insertions(+)
+ create mode 100644 bsps/powerpc/ibookg3/README.md
+ create mode 100644 bsps/powerpc/ibookg3/console/console-escc.c
+ create mode 100644 bsps/powerpc/ibookg3/include/bsp.h
+ create mode 100644 bsps/powerpc/ibookg3/include/bsp/irq.h
+ create mode 100644 bsps/powerpc/ibookg3/include/tm27.h
+ create mode 100644 bsps/powerpc/ibookg3/irq/irq-dispatch.c
+ create mode 100644 bsps/powerpc/ibookg3/irq/irq.c
+ create mode 100644 bsps/powerpc/ibookg3/start/bspstart.c
+ create mode 100644 bsps/powerpc/ibookg3/start/linkcmds
+ create mode 100644 bsps/powerpc/ibookg3/start/memory.c
+ create mode 100644 bsps/powerpc/ibookg3/start/ofw.c
+ create mode 100644 bsps/powerpc/ibookg3/start/start.S
+ create mode 100644 spec/build/bsps/powerpc/ibookg3/abi.yml
+ create mode 100644 spec/build/bsps/powerpc/ibookg3/bspibookg3.yml
+ create mode 100644 spec/build/bsps/powerpc/ibookg3/start.yml
+
+diff --git a/bsps/powerpc/ibookg3/README.md b/bsps/powerpc/ibookg3/README.md
+new file mode 100644
+index 00000000000..5515c614b25
+--- /dev/null
++++ b/bsps/powerpc/ibookg3/README.md
+@@ -0,0 +1,56 @@
++ibookg3
++=======
++
++BSP for the Apple iBook G3 (PowerPC 750 family, NewWorld Open Firmware,
++UniNorth host bridge, KeyLargo mac-io). It is developed against QEMU's
++`mac99` machine with `-cpu 750cx`, which models this hardware.
++
++What it uses:
++
++* Open Firmware client interface at boot, to read the CPU, bus and timebase
++  frequencies, the RAM size and the mac-io base address from the device tree
++* KeyLargo ESCC channel A (Z85C30) as a polled console
++* decrementer as the clock, timebase as the CPU counter
++* KeyLargo OpenPIC for external interrupts, with the generic interrupt
++  controller API (enable, disable, priorities, pending state); handlers may
++  be preempted by interrupts of higher priority
++* BATs: RAM cached, the mac-io/PCI space at `0x80000000` uncached and guarded
++
++Memory layout: the image is linked to run at 16 MiB (`0x01000000`) with load
++addresses starting at zero, which is what QEMU's `mac99` `-kernel` loader
++expects. The work area runs from the end of the image to the end of RAM as
++reported by Open Firmware. The low 16 MiB holds the exception vectors and is
++otherwise unused.
++
++Interrupt vectors
++-----------------
++
++* 0 to 63: OpenPIC sources
++* 64 to 67: OpenPIC inter-processor interrupts sent to this processor; these
++  are software interrupts which `rtems_interrupt_raise()` can trigger (Time
++  Test 27 and the validation tests use the first two)
++* 68: decrementer
++
++Running on QEMU
++---------------
++
++```shell
++qemu-system-ppc -M mac99 -cpu 750cx -m 128 -nographic -kernel app.exe
++```
++
++The console is the first serial port. After shutdown the BSP idles; it does
++not power off the machine.
++
++For the test suite use `-icount shift=4,align=off` (as `rtems-test` does for
++QEMU): the timer interrupts then follow the instruction count, which the
++timing sensitive tests need. With rtems-tools, use the `ibookg3-qemu` BSP
++configuration of the tester.
++
++Limitations
++-----------
++
++* Only tested on QEMU. Booting on real hardware needs a loader path from
++  Open Firmware (for example from disk) that places the image at 16 MiB.
++* No framebuffer console; the real iBook has no external serial port.
++* No PMU support (power off, real-time clock, battery).
++* No drivers for the other KeyLargo or PCI devices.
+diff --git a/bsps/powerpc/ibookg3/console/console-escc.c b/bsps/powerpc/ibookg3/console/console-escc.c
+new file mode 100644
+index 00000000000..d79e379c9d2
+--- /dev/null
++++ b/bsps/powerpc/ibookg3/console/console-escc.c
+@@ -0,0 +1,109 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++
++/**
++ * @file
++ *
++ * @ingroup RTEMSBSPsPowerPCiBookG3
++ *
++ * @brief Polled console on the KeyLargo ESCC (Z85C30) channel A.
++ */
++
++/*
++ * Copyright (C) 2026 Erik Gonzalez
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++/*
++ * Open Firmware has already set up the channel; only the transmit and receive
++ * status bits in read register 0 are used. With the register pointer at
++ * zero, a read of the control port returns RR0.
++ */
++
++#include <bsp.h>
++#include <bsp/console-polled.h>
++#include <rtems/bspIo.h>
++
++#define RR0_RX_CHAR_AVAILABLE 0x01
++#define RR0_TX_BUFFER_EMPTY 0x04
++
++static volatile uint8_t *escc_reg(uintptr_t offset)
++{
++  return (volatile uint8_t *) (ibookg3_macio_base + offset);
++}
++
++static uint8_t escc_rr0(void)
++{
++  uint8_t rr0 = *escc_reg(IBOOKG3_MACIO_ESCC_CHA_CTRL);
++
++  __asm__ volatile ("eieio");
++  return rr0;
++}
++
++void console_initialize_hardware(void)
++{
++}
++
++void console_outbyte_polled(int port, char ch)
++{
++  (void) port;
++
++  while ((escc_rr0() & RR0_TX_BUFFER_EMPTY) == 0) {
++    /* wait */
++  }
++
++  *escc_reg(IBOOKG3_MACIO_ESCC_CHA_DATA) = (uint8_t) ch;
++  __asm__ volatile ("eieio");
++}
++
++int console_inbyte_nonblocking(int port)
++{
++  uint8_t ch;
++
++  (void) port;
++
++  if ((escc_rr0() & RR0_RX_CHAR_AVAILABLE) == 0) {
++    return -1;
++  }
++
++  ch = *escc_reg(IBOOKG3_MACIO_ESCC_CHA_DATA);
++  __asm__ volatile ("eieio");
++  return ch;
++}
++
++static void ibookg3_output_char(char c)
++{
++  if (c == '\n') {
++    console_outbyte_polled(0, '\r');
++  }
++
++  console_outbyte_polled(0, c);
++}
++
++static int ibookg3_poll_char(void)
++{
++  return console_inbyte_nonblocking(0);
++}
++
++BSP_output_char_function_type BSP_output_char = ibookg3_output_char;
++
++BSP_polling_getchar_function_type BSP_poll_char = ibookg3_poll_char;
+diff --git a/bsps/powerpc/ibookg3/include/bsp.h b/bsps/powerpc/ibookg3/include/bsp.h
+new file mode 100644
+index 00000000000..09001ae76d9
+--- /dev/null
++++ b/bsps/powerpc/ibookg3/include/bsp.h
+@@ -0,0 +1,97 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++
++/**
++ * @file
++ *
++ * @ingroup RTEMSBSPsPowerPCiBookG3
++ *
++ * @brief Global BSP definitions for the Apple iBook G3 (NewWorld, mac99).
++ */
++
++/*
++ * Copyright (C) 2026 Erik Gonzalez
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef LIBBSP_POWERPC_IBOOKG3_BSP_H
++#define LIBBSP_POWERPC_IBOOKG3_BSP_H
++
++/**
++ * @defgroup RTEMSBSPsPowerPCiBookG3 iBook G3
++ *
++ * @ingroup RTEMSBSPsPowerPC
++ *
++ * @brief Apple iBook G3 (PowerPC 750, NewWorld Open Firmware, KeyLargo).
++ *
++ * @{
++ */
++
++#include <bspopts.h>
++
++#ifndef ASM
++
++#include <rtems.h>
++#include <libcpu/io.h>
++#include <bsp/vectors.h>
++#include <bsp/default-initial-extension.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Values read from the Open Firmware device tree at boot */
++extern uint32_t ibookg3_timebase_frequency;
++extern uint32_t ibookg3_bus_frequency;
++extern uint32_t ibookg3_cpu_frequency;
++extern uint32_t ibookg3_memory_size;
++extern uintptr_t ibookg3_macio_base;
++
++/* KeyLargo (mac-io) register blocks, offsets from ibookg3_macio_base */
++#define IBOOKG3_MACIO_ESCC_CHA_CTRL 0x13020
++#define IBOOKG3_MACIO_ESCC_CHA_DATA 0x13030
++#define IBOOKG3_MACIO_OPENPIC 0x40000
++
++/* Used if Open Firmware does not provide the value */
++#define IBOOKG3_MACIO_BASE_DEFAULT 0x80000000
++#define IBOOKG3_MEMORY_SIZE_DEFAULT 0x08000000
++
++/* Called from start.S while Open Firmware is still in control */
++void ibookg3_ofw_probe(void *ofw_entry);
++
++#define BSP_Convert_decrementer( _value ) ( (unsigned long long) _value )
++
++int BSP_disconnect_clock_handler(void);
++
++int BSP_connect_clock_handler(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* ASM */
++
++#define BSP_HAS_NO_VME
++
++/** @} */
++
++#endif /* LIBBSP_POWERPC_IBOOKG3_BSP_H */
+diff --git a/bsps/powerpc/ibookg3/include/bsp/irq.h b/bsps/powerpc/ibookg3/include/bsp/irq.h
+new file mode 100644
+index 00000000000..c3933dcf00d
+--- /dev/null
++++ b/bsps/powerpc/ibookg3/include/bsp/irq.h
+@@ -0,0 +1,93 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++
++/**
++ * @file
++ *
++ * @ingroup RTEMSBSPsPowerPCiBookG3
++ *
++ * @brief Interrupt definitions: KeyLargo OpenPIC sources plus the decrementer.
++ */
++
++/*
++ * Copyright (C) 2026 Erik Gonzalez
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef LIBBSP_POWERPC_IRQ_H
++#define LIBBSP_POWERPC_IRQ_H
++
++#define BSP_SHARED_HANDLER_SUPPORT 1
++
++#define BSP_POWERPC_IRQ_GENERIC_SUPPORT 1
++
++#ifndef ASM
++
++#include <rtems/irq.h>
++
++/* KeyLargo's OpenPIC (MPIC) has 64 interrupt sources */
++#define BSP_PCI_IRQ_NUMBER 64
++#define BSP_PCI_IRQ_LOWEST_OFFSET 0
++#define BSP_PCI_IRQ_MAX_OFFSET \
++  (BSP_PCI_IRQ_LOWEST_OFFSET + BSP_PCI_IRQ_NUMBER - 1)
++
++/*
++ * OpenPIC inter-processor interrupts sent to this processor serve as
++ * software interrupts. Their vectors follow the sources, which is how the
++ * shared OpenPIC dispatcher numbers them.
++ */
++#define IBOOKG3_IRQ_IPI_NUMBER 4
++#define IBOOKG3_IRQ_IPI_0 (BSP_PCI_IRQ_MAX_OFFSET + 1)
++#define IBOOKG3_IRQ_IPI_1 (IBOOKG3_IRQ_IPI_0 + 1)
++#define IBOOKG3_IRQ_IPI_2 (IBOOKG3_IRQ_IPI_0 + 2)
++#define IBOOKG3_IRQ_IPI_3 (IBOOKG3_IRQ_IPI_0 + 3)
++
++#define BSP_PROCESSOR_IRQ_NUMBER 1
++#define BSP_PROCESSOR_IRQ_LOWEST_OFFSET \
++  (IBOOKG3_IRQ_IPI_0 + IBOOKG3_IRQ_IPI_NUMBER)
++#define BSP_PROCESSOR_IRQ_MAX_OFFSET \
++  (BSP_PROCESSOR_IRQ_LOWEST_OFFSET + BSP_PROCESSOR_IRQ_NUMBER - 1)
++
++#define BSP_IRQ_NUMBER (BSP_PROCESSOR_IRQ_MAX_OFFSET + 1)
++#define BSP_LOWEST_OFFSET BSP_PCI_IRQ_LOWEST_OFFSET
++#define BSP_MAX_OFFSET (BSP_IRQ_NUMBER - 1)
++
++#define BSP_DECREMENTER BSP_PROCESSOR_IRQ_LOWEST_OFFSET
++
++#include <bsp/irq_supp.h>
++
++#define BSP_INTERRUPT_VECTOR_COUNT BSP_IRQ_NUMBER
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Dispatches the external and decrementer exceptions */
++void bsp_interrupt_dispatch(uintptr_t exception_number);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* ASM */
++
++#endif /* LIBBSP_POWERPC_IRQ_H */
+diff --git a/bsps/powerpc/ibookg3/include/tm27.h b/bsps/powerpc/ibookg3/include/tm27.h
+new file mode 100644
+index 00000000000..c8deca9f458
+--- /dev/null
++++ b/bsps/powerpc/ibookg3/include/tm27.h
+@@ -0,0 +1,94 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++
++/**
++ * @file
++ *
++ * @ingroup RTEMSBSPsPowerPCiBookG3
++ *
++ * @brief Support for Time Test 27 and the validation test suite.
++ */
++
++/*
++ * Copyright (C) 2026 Erik Gonzalez
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++/*
++ * The test interrupts are the two OpenPIC inter-processor interrupts which
++ * the processor sends to itself. The second one has the higher priority and
++ * is used for the nested interrupt.
++ */
++
++#ifndef _RTEMS_TMTEST27
++#error "This is an RTEMS internal file you must not include directly."
++#endif
++
++#ifndef __tm27_h
++#define __tm27_h
++
++#include <bsp.h>
++#include <bsp/irq-generic.h>
++#include <bsp/irq.h>
++
++#define MUST_WAIT_FOR_INTERRUPT 1
++
++#define TM27_INTERRUPT_VECTOR_DEFAULT IBOOKG3_IRQ_IPI_0
++
++#define TM27_INTERRUPT_VECTOR_NESTED IBOOKG3_IRQ_IPI_1
++
++extern uint32_t Interrupt_nest;
++
++static inline void Install_tm27_vector( rtems_interrupt_handler handler )
++{
++  static rtems_interrupt_entry entry_low;
++  static rtems_interrupt_entry entry_high;
++
++  rtems_interrupt_entry_initialize( &entry_low, handler, NULL, "tm27 low" );
++  (void) rtems_interrupt_entry_install(
++    TM27_INTERRUPT_VECTOR_DEFAULT,
++    RTEMS_INTERRUPT_SHARED,
++    &entry_low
++  );
++
++  rtems_interrupt_entry_initialize( &entry_high, handler, NULL, "tm27 high" );
++  (void) rtems_interrupt_entry_install(
++    TM27_INTERRUPT_VECTOR_NESTED,
++    RTEMS_INTERRUPT_SHARED,
++    &entry_high
++  );
++}
++
++static inline void Cause_tm27_intr( void )
++{
++  rtems_vector_number vector;
++
++  vector = TM27_INTERRUPT_VECTOR_DEFAULT + ( Interrupt_nest >> 1 );
++  (void) rtems_interrupt_raise( vector );
++}
++
++/* An IPI is cleared by the interrupt acknowledge */
++#define Clear_tm27_intr() do { } while ( 0 )
++
++#define Lower_tm27_intr() do { } while ( 0 )
++
++#endif /* __tm27_h */
+diff --git a/bsps/powerpc/ibookg3/irq/irq-dispatch.c b/bsps/powerpc/ibookg3/irq/irq-dispatch.c
+new file mode 100644
+index 00000000000..619705ba7f1
+--- /dev/null
++++ b/bsps/powerpc/ibookg3/irq/irq-dispatch.c
+@@ -0,0 +1,71 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++
++/**
++ * @file
++ *
++ * @ingroup RTEMSBSPsPowerPCiBookG3
++ *
++ * @brief Interrupt dispatch for the KeyLargo OpenPIC and the decrementer.
++ */
++
++/*
++ * Copyright (C) 2026 Erik Gonzalez
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include <bsp.h>
++#include <bsp/irq-generic.h>
++#include <bsp/irq.h>
++#include <bsp/openpic.h>
++#include <bsp/vectors.h>
++#include <libcpu/powerpc-utility.h>
++
++/*
++ * Called by the exception code for the external and decrementer exceptions.
++ * OpenPIC interrupts are acknowledged and serviced until none is left; the
++ * handlers run with external interrupts enabled, so that an interrupt of
++ * higher priority may preempt them.
++ */
++void bsp_interrupt_dispatch(uintptr_t exception_number)
++{
++  if (exception_number == ASM_DEC_VECTOR) {
++    bsp_interrupt_handler_dispatch(BSP_DECREMENTER);
++    return;
++  }
++
++  while (true) {
++    unsigned int vector = openpic_irq(0);
++    uint32_t msr;
++
++    if (vector == OPENPIC_VEC_SPURIOUS) {
++      break;
++    }
++
++    msr = ppc_external_exceptions_enable();
++    bsp_interrupt_handler_dispatch(
++      vector - OPENPIC_VEC_SOURCE + BSP_PCI_IRQ_LOWEST_OFFSET
++    );
++    ppc_external_exceptions_disable(msr);
++    openpic_eoi(0);
++  }
++}
+diff --git a/bsps/powerpc/ibookg3/irq/irq.c b/bsps/powerpc/ibookg3/irq/irq.c
+new file mode 100644
+index 00000000000..e5f144aa812
+--- /dev/null
++++ b/bsps/powerpc/ibookg3/irq/irq.c
+@@ -0,0 +1,322 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++
++/**
++ * @file
++ *
++ * @ingroup RTEMSBSPsPowerPCiBookG3
++ *
++ * @brief Interrupt support for the KeyLargo OpenPIC and the decrementer.
++ */
++
++/*
++ * Copyright (C) 2026 Erik Gonzalez
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++/*
++ * The shared PowerPC OpenPIC driver (openpic.c) does the low-level controller
++ * setup. This file provides the dispatch and the generic interrupt
++ * controller API on top of it.
++ *
++ * Vectors 0 to 63 are the OpenPIC sources, followed by the four OpenPIC
++ * inter-processor interrupts which this processor sends to itself (software
++ * interrupts that can be raised). The decrementer has its own vector; it is
++ * always enabled at the controller level.
++ */
++
++#include <bsp.h>
++#include <bsp/fatal.h>
++#include <bsp/irq-generic.h>
++#include <bsp/irq.h>
++#include <bsp/openpic.h>
++#include <bsp/vectors.h>
++#include <libcpu/io.h>
++
++/* OpenPIC priority 0 masks a source; RTEMS priority = 15 - OpenPIC priority */
++#define IBOOKG3_PIC_PRIORITY_MAX 15
++
++#define IBOOKG3_PIC_PRIORITY_DEFAULT 8
++
++static rtems_irq_connect_data ibookg3_irq_table[BSP_IRQ_NUMBER];
++
++static rtems_irq_prio ibookg3_irq_prio[BSP_IRQ_NUMBER];
++
++static rtems_irq_global_settings ibookg3_irq_config;
++
++static const rtems_irq_connect_data ibookg3_irq_default = {
++  .name = 0,
++  .hdl = NULL
++};
++
++RTEMS_STATIC_ASSERT(
++  IBOOKG3_IRQ_IPI_0 ==
++    OPENPIC_VEC_IPI - OPENPIC_VEC_SOURCE + BSP_PCI_IRQ_LOWEST_OFFSET,
++  ibookg3_irq_ipi_0
++);
++
++static bool is_pic_source(rtems_vector_number vector)
++{
++  return vector >= BSP_PCI_IRQ_LOWEST_OFFSET &&
++    vector <= BSP_PCI_IRQ_MAX_OFFSET;
++}
++
++static bool is_ipi(rtems_vector_number vector)
++{
++  return vector >= IBOOKG3_IRQ_IPI_0 &&
++    vector < IBOOKG3_IRQ_IPI_0 + IBOOKG3_IRQ_IPI_NUMBER;
++}
++
++static bool is_pic_vector(rtems_vector_number vector)
++{
++  return is_pic_source(vector) || is_ipi(vector);
++}
++
++/* Vector/priority register of a source or IPI */
++static volatile uint32_t *pic_vpr_reg(rtems_vector_number vector)
++{
++  if (is_ipi(vector)) {
++    return (volatile uint32_t *)
++      &OpenPIC->Global.IPI_Vector_Priority(vector - IBOOKG3_IRQ_IPI_0);
++  }
++
++  return (volatile uint32_t *)
++    &OpenPIC->Source[vector - BSP_PCI_IRQ_LOWEST_OFFSET].Vector_Priority;
++}
++
++static uint32_t pic_vpr(rtems_vector_number vector)
++{
++  return in_le32(pic_vpr_reg(vector));
++}
++
++static void pic_vpr_modify(
++  rtems_vector_number vector,
++  uint32_t            clear,
++  uint32_t            set
++)
++{
++  rtems_interrupt_level level;
++  volatile uint32_t *reg = pic_vpr_reg(vector);
++
++  rtems_interrupt_disable(level);
++  out_le32(reg, (in_le32(reg) & ~clear) | set);
++  rtems_interrupt_enable(level);
++}
++
++rtems_status_code bsp_interrupt_get_attributes(
++  rtems_vector_number         vector,
++  rtems_interrupt_attributes *attributes
++)
++{
++  bsp_interrupt_assert(bsp_interrupt_is_valid_vector(vector));
++
++  attributes->is_maskable = true;
++
++  if (is_pic_vector(vector)) {
++    attributes->can_raise = is_ipi(vector);
++    attributes->can_enable = true;
++    attributes->maybe_enable = true;
++    attributes->can_disable = true;
++    attributes->maybe_disable = true;
++    attributes->cleared_by_acknowledge = true;
++    attributes->can_get_priority = true;
++    attributes->can_set_priority = true;
++    attributes->maximum_priority = IBOOKG3_PIC_PRIORITY_MAX;
++  }
++
++  return RTEMS_SUCCESSFUL;
++}
++
++rtems_status_code bsp_interrupt_is_pending(
++  rtems_vector_number vector,
++  bool               *pending
++)
++{
++  bsp_interrupt_assert(bsp_interrupt_is_valid_vector(vector));
++  bsp_interrupt_assert(pending != NULL);
++
++  if (is_pic_vector(vector)) {
++    *pending = (pic_vpr(vector) & OPENPIC_ACTIVITY) != 0;
++  } else {
++    /* The processor has no readable decrementer exception status */
++    *pending = false;
++  }
++
++  return RTEMS_SUCCESSFUL;
++}
++
++rtems_status_code bsp_interrupt_raise(rtems_vector_number vector)
++{
++  bsp_interrupt_assert(bsp_interrupt_is_valid_vector(vector));
++
++  if (!is_ipi(vector)) {
++    return RTEMS_UNSATISFIED;
++  }
++
++  /* Send the IPI to this processor (processor 0) */
++  openpic_cause_IPI(0, vector - IBOOKG3_IRQ_IPI_0, 1);
++  return RTEMS_SUCCESSFUL;
++}
++
++rtems_status_code bsp_interrupt_clear(rtems_vector_number vector)
++{
++  bsp_interrupt_assert(bsp_interrupt_is_valid_vector(vector));
++  return RTEMS_UNSATISFIED;
++}
++
++rtems_status_code bsp_interrupt_vector_is_enabled(
++  rtems_vector_number vector,
++  bool               *enabled
++)
++{
++  bsp_interrupt_assert(bsp_interrupt_is_valid_vector(vector));
++  bsp_interrupt_assert(enabled != NULL);
++
++  if (is_pic_vector(vector)) {
++    *enabled = (pic_vpr(vector) & OPENPIC_MASK) == 0;
++  } else {
++    *enabled = true;
++  }
++
++  return RTEMS_SUCCESSFUL;
++}
++
++rtems_status_code bsp_interrupt_vector_enable(rtems_vector_number vector)
++{
++  bsp_interrupt_assert(bsp_interrupt_is_valid_vector(vector));
++
++  if (!is_pic_vector(vector)) {
++    return RTEMS_UNSATISFIED;
++  }
++
++  pic_vpr_modify(vector, OPENPIC_MASK, 0);
++  return RTEMS_SUCCESSFUL;
++}
++
++rtems_status_code bsp_interrupt_vector_disable(rtems_vector_number vector)
++{
++  bsp_interrupt_assert(bsp_interrupt_is_valid_vector(vector));
++
++  if (!is_pic_vector(vector)) {
++    return RTEMS_UNSATISFIED;
++  }
++
++  pic_vpr_modify(vector, 0, OPENPIC_MASK);
++  return RTEMS_SUCCESSFUL;
++}
++
++rtems_status_code bsp_interrupt_set_priority(
++  rtems_vector_number vector,
++  uint32_t            priority
++)
++{
++  bsp_interrupt_assert(bsp_interrupt_is_valid_vector(vector));
++
++  if (!is_pic_vector(vector)) {
++    return RTEMS_UNSATISFIED;
++  }
++
++  if (priority > IBOOKG3_PIC_PRIORITY_MAX) {
++    return RTEMS_INVALID_PRIORITY;
++  }
++
++  pic_vpr_modify(
++    vector,
++    OPENPIC_PRIORITY_MASK,
++    (IBOOKG3_PIC_PRIORITY_MAX - priority) << OPENPIC_PRIORITY_SHIFT
++  );
++  return RTEMS_SUCCESSFUL;
++}
++
++rtems_status_code bsp_interrupt_get_priority(
++  rtems_vector_number vector,
++  uint32_t           *priority
++)
++{
++  bsp_interrupt_assert(bsp_interrupt_is_valid_vector(vector));
++  bsp_interrupt_assert(priority != NULL);
++
++  if (!is_pic_vector(vector)) {
++    return RTEMS_UNSATISFIED;
++  }
++
++  *priority = IBOOKG3_PIC_PRIORITY_MAX -
++    ((pic_vpr(vector) & OPENPIC_PRIORITY_MASK) >> OPENPIC_PRIORITY_SHIFT);
++  return RTEMS_SUCCESSFUL;
++}
++
++/*
++ * Handler for the external and decrementer exceptions. The dispatch itself
++ * is in irq-dispatch.c, a separate file, so that tests can wrap
++ * bsp_interrupt_dispatch() at link time.
++ */
++static int ibookg3_exception_dispatch(
++  BSP_Exception_frame *frame,
++  unsigned int         exception_number
++)
++{
++  (void) frame;
++
++  bsp_interrupt_dispatch(exception_number);
++  return 0;
++}
++
++void bsp_interrupt_facility_initialize(void)
++{
++  rtems_status_code sc;
++  int i;
++
++  OpenPIC = (void *) (ibookg3_macio_base + IBOOKG3_MACIO_OPENPIC);
++  openpic_init(1, NULL, NULL, BSP_PCI_IRQ_NUMBER, 0, 0);
++
++  for (i = 0; i < BSP_IRQ_NUMBER; ++i) {
++    ibookg3_irq_table[i] = ibookg3_irq_default;
++    ibookg3_irq_table[i].name = i;
++  }
++
++  for (i = BSP_PCI_IRQ_LOWEST_OFFSET; i <= BSP_PCI_IRQ_MAX_OFFSET; ++i) {
++    ibookg3_irq_prio[i] = IBOOKG3_PIC_PRIORITY_DEFAULT;
++  }
++
++  ibookg3_irq_config.irqNb = BSP_IRQ_NUMBER;
++  ibookg3_irq_config.defaultEntry = ibookg3_irq_default;
++  ibookg3_irq_config.irqHdlTbl = ibookg3_irq_table;
++  ibookg3_irq_config.irqBase = BSP_LOWEST_OFFSET;
++  ibookg3_irq_config.irqPrioTbl = ibookg3_irq_prio;
++
++  if (!BSP_setup_the_pic(&ibookg3_irq_config)) {
++    bsp_fatal(BSP_FATAL_INTERRUPT_INITIALIZATION);
++  }
++
++  /* IPIs: masked until enabled, priority 1 higher for each one */
++  for (i = 0; i < IBOOKG3_IRQ_IPI_NUMBER; ++i) {
++    openpic_initipi(i, IBOOKG3_PIC_PRIORITY_DEFAULT + i, OPENPIC_VEC_IPI + i);
++    pic_vpr_modify(IBOOKG3_IRQ_IPI_0 + i, 0, OPENPIC_MASK);
++  }
++
++  sc = ppc_exc_set_handler(ASM_EXT_VECTOR, ibookg3_exception_dispatch);
++  _Assert_Unused_variable_equals(sc, RTEMS_SUCCESSFUL);
++
++  sc = ppc_exc_set_handler(ASM_DEC_VECTOR, ibookg3_exception_dispatch);
++  _Assert_Unused_variable_equals(sc, RTEMS_SUCCESSFUL);
++
++}
+diff --git a/bsps/powerpc/ibookg3/start/bspstart.c b/bsps/powerpc/ibookg3/start/bspstart.c
+new file mode 100644
+index 00000000000..b2458736b4b
+--- /dev/null
++++ b/bsps/powerpc/ibookg3/start/bspstart.c
+@@ -0,0 +1,126 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++
++/**
++ * @file
++ *
++ * @ingroup RTEMSBSPsPowerPCiBookG3
++ *
++ * @brief BSP startup.
++ */
++
++/*
++ * Copyright (C) 2026 Erik Gonzalez
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include <bsp.h>
++#include <bsp/bootcard.h>
++#include <bsp/irq.h>
++#include <bsp/irq-generic.h>
++#include <bsp/linker-symbols.h>
++#include <rtems/bspIo.h>
++#include <rtems/counter.h>
++#include <rtems/error.h>
++#include <rtems/powerpc/powerpc.h>
++
++#include <libcpu/bat.h>
++#include <libcpu/cpuIdent.h>
++#include <libcpu/spr.h>
++
++/* Used by the shared decrementer clock driver: ticks per ms = bus/divisor */
++unsigned int BSP_bus_frequency;
++unsigned int BSP_time_base_divisor;
++
++uint32_t bsp_clicks_per_usec;
++
++uint32_t _CPU_Counter_frequency(void)
++{
++  return ibookg3_timebase_frequency;
++}
++
++/* BAT size: smallest power of two from 128 KiB to 256 MiB covering size */
++static uint32_t bat_size(uint32_t size)
++{
++  uint32_t bat = 128 * 1024;
++
++  while (bat < size && bat < 256 * 1024 * 1024) {
++    bat <<= 1;
++  }
++
++  return bat;
++}
++
++void bsp_start(void)
++{
++  uintptr_t ram_end = ibookg3_memory_size;
++  uintptr_t image_end = (uintptr_t) bsp_section_work_begin;
++  uintptr_t io = ibookg3_macio_base & 0xf0000000;
++
++  if (ram_end == 0) {
++    ram_end = IBOOKG3_MEMORY_SIZE_DEFAULT;
++  }
++
++  get_ppc_cpu_type();
++
++  BSP_bus_frequency = ibookg3_timebase_frequency;
++  BSP_time_base_divisor = 1000;
++  bsp_clicks_per_usec = ibookg3_timebase_frequency / 1000000;
++
++  /*
++   * RAM cached; KeyLargo and the rest of the PCI space uncached, guarded.
++   * Translation is on before the exceptions are initialized, so that the
++   * exception handlers run with it too and see the I/O space uncached.
++   */
++  setdbat(0, 0, 0, bat_size(ram_end), _PAGE_RW);
++  setibat(0, 0, 0, bat_size(ram_end), 0);
++  setdbat(1, io, io, 256 * 1024 * 1024, IO_PAGE);
++
++  _write_MSR(_read_MSR() | MSR_DR | MSR_IR);
++  __asm__ volatile("sync; isync");
++
++  /* Vectors at 0 (MSR[IP] = 0), replacing those of Open Firmware */
++  ppc_exc_initialize_with_vector_base(
++    (uintptr_t) _ISR_Stack_area_begin,
++    NULL
++  );
++
++  bsp_interrupt_initialize();
++
++  if (ram_end < image_end) {
++    rtems_panic(
++      "iBook G3: %lu MiB RAM is less than the image end at 0x%08lx\n",
++      (unsigned long) (ram_end / (1024 * 1024)),
++      (unsigned long) image_end
++    );
++  }
++
++  printk(
++    "iBook G3: CPU %lu MHz, bus %lu MHz, timebase %lu Hz, RAM %lu MiB,"
++    " mac-io 0x%08lx\n",
++    (unsigned long) (ibookg3_cpu_frequency / 1000000),
++    (unsigned long) (ibookg3_bus_frequency / 1000000),
++    (unsigned long) ibookg3_timebase_frequency,
++    (unsigned long) (ibookg3_memory_size / (1024 * 1024)),
++    (unsigned long) ibookg3_macio_base
++  );
++}
+diff --git a/bsps/powerpc/ibookg3/start/linkcmds b/bsps/powerpc/ibookg3/start/linkcmds
+new file mode 100644
+index 00000000000..8afb8ab0282
+--- /dev/null
++++ b/bsps/powerpc/ibookg3/start/linkcmds
+@@ -0,0 +1,86 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++
++/*
++ * Copyright (C) 2026 Erik Gonzalez
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++/*
++ * The image runs at 16 MiB, above Open Firmware's low memory, and the
++ * exception vectors RTEMS installs at address zero. QEMU's mac99 loader
++ * places a segment at (physical address & 0x0fffffff) + 16 MiB and enters at
++ * 16 MiB, so the load addresses start at zero.
++ *
++ * The regions cover only the image (code, data, bss, interrupt stack). The
++ * work area from the end of the image to the end of RAM is set up at run
++ * time from the Open Firmware memory size (see memory.c), so that no loader
++ * has to clear all of RAM.
++ */
++
++EXTERN (_start)
++ENTRY (_start)
++
++MEMORY {
++	RAM       : ORIGIN = 0x01000000, LENGTH = 16M
++	LOAD      : ORIGIN = 0x00000000, LENGTH = 16M
++	EMPTY     : ORIGIN = 0x0, LENGTH = 0
++}
++
++REGION_ALIAS ("REGION_START", RAM);
++REGION_ALIAS ("REGION_FAST_TEXT", RAM);
++REGION_ALIAS ("REGION_FAST_TEXT_LOAD", LOAD);
++REGION_ALIAS ("REGION_TEXT", RAM);
++REGION_ALIAS ("REGION_TEXT_LOAD", LOAD);
++REGION_ALIAS ("REGION_RODATA", RAM);
++REGION_ALIAS ("REGION_RODATA_LOAD", LOAD);
++REGION_ALIAS ("REGION_FAST_DATA", RAM);
++REGION_ALIAS ("REGION_FAST_DATA_LOAD", LOAD);
++REGION_ALIAS ("REGION_DATA", RAM);
++REGION_ALIAS ("REGION_DATA_LOAD", LOAD);
++REGION_ALIAS ("REGION_BSS", RAM);
++REGION_ALIAS ("REGION_RTEMSSTACK", RAM);
++REGION_ALIAS ("REGION_WORK", RAM);
++REGION_ALIAS ("REGION_STACK", RAM);
++REGION_ALIAS ("REGION_NOCACHE", EMPTY);
++REGION_ALIAS ("REGION_NOCACHE_LOAD", EMPTY);
++REGION_ALIAS ("REGION_NVRAM", EMPTY);
++
++/*
++ * One segment for the whole image, so that the uninitialized sections are
++ * placed with the same offset as the rest and not 16 MiB too high.
++ */
++PHDRS {
++	image PT_LOAD;
++}
++
++/* The entry code must be the first byte loaded (see above) */
++SECTIONS {
++	.ibookg3_entry : {
++		KEEP (*(.ibookg3_entry))
++	} > RAM AT > LOAD :image
++}
++
++/* Allocate the maximum size to the small data area */
++bsp_section_small_data_area_size = 65536;
++
++INCLUDE linkcmds.base
+diff --git a/bsps/powerpc/ibookg3/start/memory.c b/bsps/powerpc/ibookg3/start/memory.c
+new file mode 100644
+index 00000000000..6b674f89721
+--- /dev/null
++++ b/bsps/powerpc/ibookg3/start/memory.c
+@@ -0,0 +1,73 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++
++/**
++ * @file
++ *
++ * @ingroup RTEMSBSPsPowerPCiBookG3
++ *
++ * @brief Work area from the end of the image to the end of RAM.
++ */
++
++/*
++ * Copyright (C) 2026 Erik Gonzalez
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++/*
++ * The linker regions only cover the loaded image, so that a boot loader does
++ * not have to clear all of RAM. The RAM size comes from Open Firmware.
++ */
++
++#include <bsp.h>
++#include <bsp/bootcard.h>
++#include <bsp/linker-symbols.h>
++
++#include <rtems/sysinit.h>
++
++static Memory_Area _Memory_Areas[1];
++
++static void bsp_memory_initialize(void)
++{
++  uintptr_t begin = (uintptr_t) bsp_section_work_begin;
++  uintptr_t end = ibookg3_memory_size;
++
++  if (end == 0) {
++    end = IBOOKG3_MEMORY_SIZE_DEFAULT;
++  }
++
++  _Memory_Initialize(&_Memory_Areas[0], (void *) begin, (void *) end);
++}
++
++RTEMS_SYSINIT_ITEM(
++  bsp_memory_initialize,
++  RTEMS_SYSINIT_MEMORY,
++  RTEMS_SYSINIT_ORDER_MIDDLE
++);
++
++static const Memory_Information _Memory_Information =
++  MEMORY_INFORMATION_INITIALIZER(_Memory_Areas);
++
++const Memory_Information *_Memory_Get(void)
++{
++  return &_Memory_Information;
++}
+diff --git a/bsps/powerpc/ibookg3/start/ofw.c b/bsps/powerpc/ibookg3/start/ofw.c
+new file mode 100644
+index 00000000000..30405e3b178
+--- /dev/null
++++ b/bsps/powerpc/ibookg3/start/ofw.c
+@@ -0,0 +1,193 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++
++/**
++ * @file
++ *
++ * @ingroup RTEMSBSPsPowerPCiBookG3
++ *
++ * @brief Reads the machine description from the Open Firmware device tree.
++ */
++
++/*
++ * Copyright (C) 2026 Erik Gonzalez
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include <bsp.h>
++
++#include <string.h>
++
++/*
++ * Values the rest of the BSP uses. The defaults match QEMU's mac99 machine
++ * and are kept if a property is missing.
++ */
++uint32_t ibookg3_timebase_frequency = 25000000;
++uint32_t ibookg3_bus_frequency = 100000000;
++uint32_t ibookg3_cpu_frequency = 900000000;
++uint32_t ibookg3_memory_size;
++uintptr_t ibookg3_macio_base = IBOOKG3_MACIO_BASE_DEFAULT;
++
++typedef int32_t phandle;
++
++typedef int (*ofw_entry_fn)(void *args);
++
++static ofw_entry_fn ofw;
++
++/* IEEE 1275 client interface argument block */
++struct ofw_args {
++  const char *service;
++  int32_t nargs;
++  int32_t nret;
++  uint32_t args[6];
++};
++
++static int32_t ofw_call(
++  const char *service,
++  int nargs,
++  int nret,
++  uint32_t a0,
++  uint32_t a1,
++  uint32_t a2,
++  uint32_t a3
++)
++{
++  struct ofw_args a = {
++    .service = service,
++    .nargs = nargs,
++    .nret = nret,
++    .args = { a0, a1, a2, a3, 0, 0 }
++  };
++
++  if ((*ofw)(&a) != 0) {
++    return -1;
++  }
++
++  return (int32_t) a.args[nargs];
++}
++
++static phandle ofw_finddevice(const char *path)
++{
++  return ofw_call("finddevice", 1, 1, (uintptr_t) path, 0, 0, 0);
++}
++
++static phandle ofw_child(phandle node)
++{
++  return ofw_call("child", 1, 1, (uint32_t) node, 0, 0, 0);
++}
++
++static phandle ofw_peer(phandle node)
++{
++  return ofw_call("peer", 1, 1, (uint32_t) node, 0, 0, 0);
++}
++
++static int32_t ofw_getprop(
++  phandle node,
++  const char *name,
++  void *buf,
++  uint32_t len
++)
++{
++  return ofw_call(
++    "getprop",
++    4,
++    1,
++    (uint32_t) node,
++    (uintptr_t) name,
++    (uintptr_t) buf,
++    len
++  );
++}
++
++static void ofw_get_u32(phandle node, const char *name, uint32_t *value)
++{
++  uint32_t v;
++
++  if (ofw_getprop(node, name, &v, sizeof(v)) == (int32_t) sizeof(v)) {
++    *value = v;
++  }
++}
++
++/* Depth-first search for the first node with the given name */
++static phandle ofw_find_by_name(phandle node, const char *name)
++{
++  while (node != 0 && node != -1) {
++    char buf[32];
++    int32_t len = ofw_getprop(node, "name", buf, sizeof(buf) - 1);
++    phandle found;
++
++    if (len > 0) {
++      buf[len] = '\0';
++      if (strcmp(buf, name) == 0) {
++        return node;
++      }
++    }
++
++    found = ofw_find_by_name(ofw_child(node), name);
++    if (found != 0 && found != -1) {
++      return found;
++    }
++
++    node = ofw_peer(node);
++  }
++
++  return 0;
++}
++
++void ibookg3_ofw_probe(void *ofw_entry)
++{
++  phandle node;
++  uint32_t reg[16];
++  int32_t len;
++
++  ofw = (ofw_entry_fn) ofw_entry;
++
++  node = ofw_finddevice("/cpus");
++  if (node != -1) {
++    node = ofw_child(node);
++    if (node != 0 && node != -1) {
++      ofw_get_u32(node, "timebase-frequency", &ibookg3_timebase_frequency);
++      ofw_get_u32(node, "bus-frequency", &ibookg3_bus_frequency);
++      ofw_get_u32(node, "clock-frequency", &ibookg3_cpu_frequency);
++    }
++  }
++
++  /* RAM contiguous from address zero; reg is a list of (base, size) */
++  node = ofw_finddevice("/memory");
++  if (node != -1) {
++    len = ofw_getprop(node, "reg", reg, sizeof(reg));
++    for (int32_t i = 0; i + 1 < len / 4; i += 2) {
++      if (reg[i] == ibookg3_memory_size) {
++        ibookg3_memory_size += reg[i + 1];
++      }
++    }
++  }
++
++  /* assigned-addresses: phys.hi, phys.mid, phys.lo, size.hi, size.lo */
++  node = ofw_find_by_name(ofw_peer(0), "mac-io");
++  if (node != 0) {
++    len = ofw_getprop(node, "assigned-addresses", reg, sizeof(reg));
++    if (len >= 5 * 4) {
++      ibookg3_macio_base = reg[2];
++    }
++  }
++}
+diff --git a/bsps/powerpc/ibookg3/start/start.S b/bsps/powerpc/ibookg3/start/start.S
+new file mode 100644
+index 00000000000..b663cbe25ba
+--- /dev/null
++++ b/bsps/powerpc/ibookg3/start/start.S
+@@ -0,0 +1,92 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++
++/**
++ * @file
++ *
++ * @ingroup RTEMSBSPsPowerPCiBookG3
++ *
++ * @brief Entry point, called by Open Firmware with r5 = client interface.
++ */
++
++/*
++ * Copyright (C) 2026 Erik Gonzalez
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++/*
++ * Open Firmware (or QEMU's mac99 loader) enters here with the MMU on and its
++ * own translations in place. The image is linked to run where it is loaded,
++ * so no relocation is needed. While Open Firmware is still usable, read the
++ * device tree, then switch to real mode and boot RTEMS, which installs its
++ * own exception vectors and BATs.
++ */
++
++#include <rtems/asm.h>
++#include <rtems/score/cpu.h>
++#include <libcpu/powerpc-utility.h>
++
++	.section ".ibookg3_entry", "ax"
++
++	.globl	_start
++	.type	_start, @function
++_start:
++	mr	r31, r5			/* Open Firmware client interface */
++
++	/* stack */
++	LA	r1, _ISR_Stack_area_end
++	li	r0, CPU_STACK_ALIGNMENT - 1
++	andc	r1, r1, r0
++	li	r0, 0
++	stwu	r0, -CPU_STACK_ALIGNMENT(r1)
++
++	/* clear .sbss and .bss */
++	LA	r3, bsp_section_sbss_begin
++	LA	r4, bsp_section_bss_end
++	subf	r5, r3, r4
++	li	r4, 0
++	bl	memset
++
++	/* small data area pointers */
++	bl	__eabi
++
++	mr	r3, r31
++	bl	ibookg3_ofw_probe
++
++	/*
++	 * Leave Open Firmware: real mode, external interrupts off. Use a defined
++	 * MSR instead of the one of Open Firmware, which has MSR[RI] and MSR[ME]
++	 * cleared; the exception code expects MSR[RI] set in normal operation.
++	 */
++	LA	r3, .Lreal_mode
++	mtsrr0	r3
++	LWI	r3, MSR_FP | MSR_ME | MSR_RI
++	mtsrr1	r3
++	sync
++	rfi
++
++.Lreal_mode:
++	li	r3, 0			/* no command line */
++	bl	boot_card
++.Lhalt:
++	b	.Lhalt
++	.size	_start, . - _start
+diff --git a/spec/build/bsps/powerpc/ibookg3/abi.yml b/spec/build/bsps/powerpc/ibookg3/abi.yml
+new file mode 100644
+index 00000000000..e82b23a6ebf
+--- /dev/null
++++ b/spec/build/bsps/powerpc/ibookg3/abi.yml
+@@ -0,0 +1,20 @@
++SPDX-License-Identifier: CC-BY-SA-4.0 OR BSD-2-Clause
++actions:
++- get-string: null
++- split: null
++- env-append: null
++build-type: option
++copyrights:
++- Copyright (C) 2026 Erik Gonzalez
++default:
++- enabled-by: true
++  value:
++  - -mcpu=750
++  - -meabi
++  - -msdata=sysv
++description: |
++  ABI flags
++enabled-by: true
++links: []
++name: ABI_FLAGS
++type: build
+diff --git a/spec/build/bsps/powerpc/ibookg3/bspibookg3.yml b/spec/build/bsps/powerpc/ibookg3/bspibookg3.yml
+new file mode 100644
+index 00000000000..3da19ad4ab9
+--- /dev/null
++++ b/spec/build/bsps/powerpc/ibookg3/bspibookg3.yml
+@@ -0,0 +1,72 @@
++SPDX-License-Identifier: CC-BY-SA-4.0 OR BSD-2-Clause
++arch: powerpc
++bsp: ibookg3
++build-type: bsp
++cflags: []
++copyrights:
++- Copyright (C) 2026 Erik Gonzalez
++cppflags: []
++enabled-by: true
++family: ibookg3
++includes: []
++install:
++- destination: ${BSP_INCLUDEDIR}
++  source:
++  - bsps/powerpc/ibookg3/include/bsp.h
++  - bsps/powerpc/ibookg3/include/tm27.h
++- destination: ${BSP_INCLUDEDIR}/bsp
++  source:
++  - bsps/powerpc/ibookg3/include/bsp/irq.h
++- destination: ${BSP_LIBDIR}
++  source:
++  - bsps/powerpc/ibookg3/start/linkcmds
++  - bsps/powerpc/shared/start/linkcmds.base
++links:
++- role: build-dependency
++  uid: ../../obj
++- role: build-dependency
++  uid: ../../objirq
++- role: build-dependency
++  uid: ../../opto2
++- role: build-dependency
++  uid: ../crti
++- role: build-dependency
++  uid: ../crtn
++- role: build-dependency
++  uid: ../grp
++- role: build-dependency
++  uid: ../obj
++- role: build-dependency
++  uid: ../objexc
++- role: build-dependency
++  uid: abi
++- role: build-dependency
++  uid: start
++- role: build-dependency
++  uid: ../../bspopts
++source:
++- bsps/powerpc/ibookg3/console/console-escc.c
++- bsps/powerpc/ibookg3/irq/irq-dispatch.c
++- bsps/powerpc/ibookg3/irq/irq.c
++- bsps/powerpc/ibookg3/start/bspstart.c
++- bsps/powerpc/ibookg3/start/memory.c
++- bsps/powerpc/ibookg3/start/ofw.c
++- bsps/powerpc/shared/altivec/vec_sup.c
++- bsps/powerpc/shared/altivec/vec_sup_asm.S
++- bsps/powerpc/shared/btimer/btimer-ppc-dec.c
++- bsps/powerpc/shared/cache/cache.c
++- bsps/powerpc/shared/clock/clock-ppc-dec.c
++- bsps/powerpc/shared/clock/p_clock.c
++- bsps/powerpc/shared/irq/openpic.c
++- bsps/powerpc/shared/irq/openpic_i8259_irq.c
++- bsps/powerpc/shared/mmu/bat.c
++- bsps/powerpc/shared/mmu/mmuAsm.S
++- bsps/powerpc/shared/mmu/pte121.c
++- bsps/shared/dev/getentropy/getentropy-cpucounter.c
++- bsps/shared/dev/serial/console-polled.c
++- bsps/shared/irq/irq-default-handler.c
++- bsps/shared/start/bspreset-loop.c
++- bsps/shared/start/mallocinitone.c
++- bsps/shared/start/wkspaceinitone.c
++- bsps/shared/start/gettargethash-default.c
++type: build
+diff --git a/spec/build/bsps/powerpc/ibookg3/start.yml b/spec/build/bsps/powerpc/ibookg3/start.yml
+new file mode 100644
+index 00000000000..88c82062aa1
+--- /dev/null
++++ b/spec/build/bsps/powerpc/ibookg3/start.yml
+@@ -0,0 +1,14 @@
++SPDX-License-Identifier: CC-BY-SA-4.0 OR BSD-2-Clause
++asflags: []
++build-type: start-file
++copyrights:
++- Copyright (C) 2026 Erik Gonzalez
++cppflags: []
++enabled-by: true
++includes: []
++install-path: ${BSP_LIBDIR}
++links: []
++source:
++- bsps/powerpc/ibookg3/start/start.S
++target: start.o
++type: build
+-- 
+2.55.0
+

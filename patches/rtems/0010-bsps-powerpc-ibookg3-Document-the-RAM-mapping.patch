@@ -1,0 +1,40 @@
+From c78bd982abfaf0a9f56f15ca17afd6d0d8799f5f Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Fri, 9 Oct 2026 22:52:29 -0700
+Subject: [PATCH 10/15] bsps/powerpc/ibookg3: Document the RAM mapping
+
+Describe how RAM above 256 MiB is mapped.
+---
+ bsps/powerpc/ibookg3/README.md | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/bsps/powerpc/ibookg3/README.md b/bsps/powerpc/ibookg3/README.md
+index b20cb481931..83e491f02ee 100644
+--- a/bsps/powerpc/ibookg3/README.md
++++ b/bsps/powerpc/ibookg3/README.md
+@@ -24,7 +24,10 @@ What it uses:
+ * KeyLargo ATA (IDE) through the shared RTEMS ATA layer, PIO programmed I/O;
+   the driver provides `/dev/ideN` controller nodes and `/dev/hdX` block
+   devices that the libblock and DOSFS layers mount
+-* BATs: RAM cached, the mac-io/PCI space at `0x80000000` uncached and guarded
++* BATs: the first 256 MiB of RAM cached, the mac-io/PCI space at
++  `0x80000000`, the PCI host bridge and the frame buffer uncached and
++  guarded; RAM above 256 MiB (the iBook takes up to 640 MiB) is mapped
++  one-to-one through a page table, since a BAT maps at most 256 MiB
+ 
+ Through rtems-libbsd (branch `bsp-ibookg3` of the workbench clone):
+ 
+@@ -54,8 +57,8 @@ Notes for QEMU
+ Memory layout: the image is linked to run at 16 MiB (`0x01000000`) with load
+ addresses starting at zero, which is what QEMU's `mac99` `-kernel` loader
+ expects. The work area runs from the end of the image to the end of RAM as
+-reported by Open Firmware. The low 16 MiB holds the exception vectors and is
+-otherwise unused.
++reported by Open Firmware. The low 16 MiB holds the exception vectors and,
++with more than 256 MiB of RAM, the page table; it is otherwise unused.
+ 
+ Interrupt vectors
+ -----------------
+-- 
+2.55.0
+

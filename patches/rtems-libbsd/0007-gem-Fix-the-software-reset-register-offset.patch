@@ -1,0 +1,39 @@
+From 33117baff2404fd91f1e5d4e7feaa7328c3df6f5 Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Fri, 9 Oct 2026 15:00:23 -0700
+Subject: [PATCH 7/7] gem: Fix the software reset register offset
+
+The software reset register of the Sun GEM / Apple GMAC is at offset
+0x1010 of the PCI BAR.  It was at offset 0x0010 of the second register
+bank, which starts at 0x1000.  FreeBSD commit 8defc88c1345 ("gem(4):
+Remove onboard-only Sun ERI and remnants of SBus support") merged the
+banks and moved the other bank two registers to 0x10xx, but left
+GEM_RESET at 0x0010, which is GEM_INTMASK.  Every reset since then
+wrote the interrupt mask and never reset the controller, so the
+driver printed "cannot reset receiver/transmitter/device".
+---
+ freebsd/sys/dev/gem/if_gemreg.h | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/freebsd/sys/dev/gem/if_gemreg.h b/freebsd/sys/dev/gem/if_gemreg.h
+index 86611c17..b6ee7df8 100644
+--- a/freebsd/sys/dev/gem/if_gemreg.h
++++ b/freebsd/sys/dev/gem/if_gemreg.h
+@@ -93,7 +93,13 @@
+ #define	GEM_PCI_BIF_CONFIG	0x1008	/* PCI BIF configuration */
+ #define	GEM_PCI_BIF_DIAG	0x100c	/* PCI BIF diagnostic */
+ 
+-#define	GEM_RESET		0x0010	/* software reset */
++/*
++ * The software reset register follows the PCI BIF registers.  It used to be
++ * at offset 0x0010 of the second register bank, which started at 0x1000; it
++ * was not moved along with the other bank two registers when the banks were
++ * merged, and 0x0010 is GEM_INTMASK.
++ */
++#define	GEM_RESET		0x1010	/* software reset */
+ 
+ /* GEM_PCI_ERROR_STATUS and GEM_PCI_ERROR_MASK error bits */
+ #define	GEM_PCI_ERR_STAT_BADACK	0x00000001	/* No ACK64# */
+-- 
+2.55.0
+

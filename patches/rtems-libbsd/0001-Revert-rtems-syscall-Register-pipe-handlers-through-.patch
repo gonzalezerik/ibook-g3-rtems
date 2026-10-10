@@ -1,0 +1,68 @@
+From 75e3573801fcdaa449f5747c45bcc2cb88e5be68 Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Thu, 8 Oct 2026 19:31:07 -0700
+Subject: [PATCH 1/7] Revert "rtems/syscall: Register pipe handlers through the
+ cpukit hooks"
+
+This reverts commit 6d027f0bb482a36706639aa74549f1afd2c39ecb.
+---
+ rtemsbsd/rtems/rtems-bsd-syscall-api.c | 21 ++++++---------------
+ 1 file changed, 6 insertions(+), 15 deletions(-)
+
+diff --git a/rtemsbsd/rtems/rtems-bsd-syscall-api.c b/rtemsbsd/rtems/rtems-bsd-syscall-api.c
+index 32c4dcde..d07eff7b 100644
+--- a/rtemsbsd/rtems/rtems-bsd-syscall-api.c
++++ b/rtemsbsd/rtems/rtems-bsd-syscall-api.c
+@@ -45,7 +45,6 @@
+ #include <sys/dirent.h>
+ #include <sys/file.h>
+ #include <sys/filedesc.h>
+-#include <sys/kernel.h>
+ #include <sys/proc.h>
+ #include <sys/syscallsubr.h>
+ #include <sys/sysproto.h>
+@@ -63,6 +62,8 @@
+ #include <stdio.h>
+ 
+ static int rtems_bsd_pipe(int fildes[2], int flags);
++int pipe(int fildes[2]);
++int pipe2(int fildes[2], int flags);
+ 
+ static int rtems_bsd_sysgen_dup(
+     rtems_libio_t *iop, const char *path, int oflag, mode_t mode);
+@@ -240,28 +241,18 @@ rtems_bsd_pipe(int fildes[2], int flags)
+ 	return 0;
+ }
+ 
+-static int
+-rtems_bsd_pipe_handler(int fildes[2])
++int
++pipe(int fildes[2])
+ {
+ 	return rtems_bsd_pipe(fildes, 0);
+ }
+ 
+-static int
+-rtems_bsd_pipe2_handler(int fildes[2], int flags)
++int
++pipe2(int fildes[2], int flags)
+ {
+ 	return rtems_bsd_pipe(fildes, flags);
+ }
+ 
+-static void
+-rtems_bsd_pipe_sysinit(void *arg)
+-{
+-	(void)arg;
+-	rtems_filesystem_register_pipe(rtems_bsd_pipe_handler);
+-	rtems_filesystem_register_pipe2(rtems_bsd_pipe2_handler);
+-}
+-SYSINIT(bsdpipe, SI_SUB_TUNABLES, SI_ORDER_FIRST, rtems_bsd_pipe_sysinit,
+-    NULL);
+-
+ int
+ accept(int socket, struct sockaddr *__restrict address,
+     socklen_t *__restrict address_len)
+-- 
+2.55.0
+

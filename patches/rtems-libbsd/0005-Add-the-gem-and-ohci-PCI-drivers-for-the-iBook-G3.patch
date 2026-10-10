@@ -1,0 +1,4007 @@
+From 2c55ce82137ae01ede58782f38c0568dfeb588a2 Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Fri, 9 Oct 2026 14:05:20 -0700
+Subject: [PATCH 5/7] Add the gem and ohci PCI drivers for the iBook G3
+
+Import if_gem.c, if_gem_pci.c, if_gemreg.h and if_gemvar.h from
+freebsd/sys/dev/gem and ohci_pci.c from freebsd/sys/dev/usb/controller
+so a powerpc NewWorld machine gets its built-in Sun GEM/Apple GMAC
+Ethernet and its Open Host Controller Interface as PCI drivers.  The
+gem files carry the usual RTEMS adaptations: the bus method
+descriptors come from the rtems/bsd/local headers and the MAC address
+comes from rtems_bsd_get_mac_address instead of Open Firmware.
+
+Declare a dev_nic_gem module and turn it on in the default buildset
+next to the other NIC modules, build ohci_pci.c as part of
+dev_usb_controller, add the RTEMS_BSD_DRIVER_PCI_GEM reference macro
+and the nexus-devices list for the ibookg3 BSP: the legacy pcib with
+gem, miibus, ukphy, ohci, usbus, uhub and umass.
+
+Verified on QEMU mac99 with the ibookg3 BSP: gem0 gets a DHCP lease
+and passes TCP in both directions, ohci0 enumerates a USB keyboard
+whose keystrokes read back through /dev/ukbd0, and umass0 attaches a
+USB mass storage device.
+---
+ buildset/default.ini                          |    1 +
+ freebsd/sys/dev/gem/if_gem.c                  | 2241 +++++++++++++++++
+ freebsd/sys/dev/gem/if_gem_pci.c              |  348 +++
+ freebsd/sys/dev/gem/if_gemreg.h               |  591 +++++
+ freebsd/sys/dev/gem/if_gemvar.h               |  264 ++
+ freebsd/sys/dev/usb/controller/ohci_pci.c     |  379 +++
+ libbsd.py                                     |   27 +
+ rtemsbsd/include/bsp/nexus-devices.h          |   16 +
+ .../include/machine/rtems-bsd-nexus-bus.h     |    9 +
+ 9 files changed, 3876 insertions(+)
+ create mode 100644 freebsd/sys/dev/gem/if_gem.c
+ create mode 100644 freebsd/sys/dev/gem/if_gem_pci.c
+ create mode 100644 freebsd/sys/dev/gem/if_gemreg.h
+ create mode 100644 freebsd/sys/dev/gem/if_gemvar.h
+ create mode 100644 freebsd/sys/dev/usb/controller/ohci_pci.c
+
+diff --git a/buildset/default.ini b/buildset/default.ini
+index 8f65347a..0dab7e40 100644
+--- a/buildset/default.ini
++++ b/buildset/default.ini
+@@ -23,6 +23,7 @@ dev_nic = on
+ dev_nic_broadcomm = on
+ dev_nic_dc = on
+ dev_nic_e1000 = on
++dev_nic_gem = on
+ dev_nic_xilinx = on
+ dev_nic_fxp = on
+ dev_nic_re = on
+diff --git a/freebsd/sys/dev/gem/if_gem.c b/freebsd/sys/dev/gem/if_gem.c
+new file mode 100644
+index 00000000..0691021f
+--- /dev/null
++++ b/freebsd/sys/dev/gem/if_gem.c
+@@ -0,0 +1,2241 @@
++#include <machine/rtems-bsd-kernel-space.h>
++
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (C) 2001 Eduardo Horvath.
++ * Copyright (c) 2001-2003 Thomas Moestl
++ * Copyright (c) 2007 Marius Strobl <marius@FreeBSD.org>
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR  ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR  BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ *
++ *	from: NetBSD: gem.c,v 1.21 2002/06/01 23:50:58 lukem Exp
++ */
++
++#include <sys/cdefs.h>
++/*
++ * Driver for Apple GMAC, Sun ERI and Sun GEM Ethernet controllers
++ */
++
++#if 0
++#define	GEM_DEBUG
++#endif
++
++#if 0	/* XXX: In case of emergency, re-enable this. */
++#define	GEM_RINT_TIMEOUT
++#endif
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/bus.h>
++#include <sys/callout.h>
++#include <sys/endian.h>
++#include <sys/mbuf.h>
++#include <sys/malloc.h>
++#include <sys/kernel.h>
++#include <sys/lock.h>
++#include <sys/module.h>
++#include <sys/mutex.h>
++#include <sys/socket.h>
++#include <sys/sockio.h>
++#include <sys/rman.h>
++
++#include <net/bpf.h>
++#include <net/ethernet.h>
++#include <net/if.h>
++#include <net/if_var.h>
++#include <net/if_arp.h>
++#include <net/if_dl.h>
++#include <net/if_media.h>
++#include <net/if_types.h>
++#include <net/if_vlan_var.h>
++
++#include <netinet/in.h>
++#include <netinet/in_systm.h>
++#include <netinet/ip.h>
++#include <netinet/tcp.h>
++#include <netinet/udp.h>
++
++#include <machine/bus.h>
++
++#include <dev/mii/mii.h>
++#include <dev/mii/miivar.h>
++
++#include <dev/gem/if_gemreg.h>
++#include <dev/gem/if_gemvar.h>
++#ifdef __rtems__
++/*
++ * The bus method descriptors live in the RTEMS local headers; the driver
++ * reference below pulls in the MII bus driver of freebsd/sys/dev/mii.
++ */
++#include <rtems/bsd/local/miibus_if.h>
++#endif /* __rtems__ */
++
++CTASSERT(powerof2(GEM_NRXDESC) && GEM_NRXDESC >= 32 && GEM_NRXDESC <= 8192);
++CTASSERT(powerof2(GEM_NTXDESC) && GEM_NTXDESC >= 32 && GEM_NTXDESC <= 8192);
++
++#define	GEM_TRIES	10000
++
++/*
++ * The hardware supports basic TCP/UDP checksum offloading.  However,
++ * the hardware doesn't compensate the checksum for UDP datagram which
++ * can yield to 0x0.  As a safe guard, UDP checksum offload is disabled
++ * by default.  It can be reactivated by setting special link option
++ * link0 with ifconfig(8).
++ */
++#define	GEM_CSUM_FEATURES	(CSUM_TCP)
++
++static int	gem_add_rxbuf(struct gem_softc *sc, int idx);
++static int	gem_bitwait(struct gem_softc *sc, bus_addr_t r, uint32_t clr,
++		    uint32_t set);
++static void	gem_cddma_callback(void *xsc, bus_dma_segment_t *segs,
++		    int nsegs, int error);
++static int	gem_disable_rx(struct gem_softc *sc);
++static int	gem_disable_tx(struct gem_softc *sc);
++static void	gem_eint(struct gem_softc *sc, u_int status);
++static void	gem_init(void *xsc);
++static void	gem_init_locked(struct gem_softc *sc);
++static void	gem_init_regs(struct gem_softc *sc);
++static int	gem_ioctl(if_t ifp, u_long cmd, caddr_t data);
++static int	gem_load_txmbuf(struct gem_softc *sc, struct mbuf **m_head);
++static int	gem_meminit(struct gem_softc *sc);
++static void	gem_mifinit(struct gem_softc *sc);
++static void	gem_reset(struct gem_softc *sc);
++static int	gem_reset_rx(struct gem_softc *sc);
++static void	gem_reset_rxdma(struct gem_softc *sc);
++static int	gem_reset_tx(struct gem_softc *sc);
++static u_int	gem_ringsize(u_int sz);
++static void	gem_rint(struct gem_softc *sc);
++#ifdef GEM_RINT_TIMEOUT
++static void	gem_rint_timeout(void *arg);
++#endif
++static inline void gem_rxcksum(struct mbuf *m, uint64_t flags);
++static void	gem_rxdrain(struct gem_softc *sc);
++static void	gem_setladrf(struct gem_softc *sc);
++static void	gem_start(if_t ifp);
++static void	gem_start_locked(if_t ifp);
++static void	gem_stop(if_t ifp, int disable);
++static void	gem_tick(void *arg);
++static void	gem_tint(struct gem_softc *sc);
++static inline void gem_txkick(struct gem_softc *sc);
++static int	gem_watchdog(struct gem_softc *sc);
++
++DRIVER_MODULE(miibus, gem, miibus_driver, 0, 0);
++MODULE_DEPEND(gem, miibus, 1, 1, 1);
++
++#ifdef GEM_DEBUG
++#include <sys/ktr.h>
++#define	KTR_GEM		KTR_SPARE2
++#endif
++
++int
++gem_attach(struct gem_softc *sc)
++{
++	struct gem_txsoft *txs;
++	if_t ifp;
++	int error, i, phy;
++	uint32_t v;
++
++	if (bootverbose)
++		device_printf(sc->sc_dev, "flags=0x%x\n", sc->sc_flags);
++
++	/* Set up ifnet structure. */
++	ifp = sc->sc_ifp = if_alloc(IFT_ETHER);
++	sc->sc_csum_features = GEM_CSUM_FEATURES;
++	if_setsoftc(ifp, sc);
++	if_initname(ifp, device_get_name(sc->sc_dev),
++	    device_get_unit(sc->sc_dev));
++	if_setflags(ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST);
++	if_setstartfn(ifp, gem_start);
++	if_setioctlfn(ifp, gem_ioctl);
++	if_setinitfn(ifp, gem_init);
++	if_setsendqlen(ifp, GEM_TXQUEUELEN);
++	if_setsendqready(ifp);
++
++	callout_init_mtx(&sc->sc_tick_ch, &sc->sc_mtx, 0);
++#ifdef GEM_RINT_TIMEOUT
++	callout_init_mtx(&sc->sc_rx_ch, &sc->sc_mtx, 0);
++#endif
++
++	/* Make sure the chip is stopped. */
++	gem_reset(sc);
++
++	error = bus_dma_tag_create(bus_get_dma_tag(sc->sc_dev), 1, 0,
++	    BUS_SPACE_MAXADDR_32BIT, BUS_SPACE_MAXADDR, NULL, NULL,
++	    BUS_SPACE_MAXSIZE_32BIT, 0, BUS_SPACE_MAXSIZE_32BIT, 0, NULL,
++	    NULL, &sc->sc_pdmatag);
++	if (error != 0)
++		goto fail_ifnet;
++
++	error = bus_dma_tag_create(sc->sc_pdmatag, 1, 0,
++	    BUS_SPACE_MAXADDR, BUS_SPACE_MAXADDR, NULL, NULL, MCLBYTES,
++	    1, MCLBYTES, BUS_DMA_ALLOCNOW, NULL, NULL, &sc->sc_rdmatag);
++	if (error != 0)
++		goto fail_ptag;
++
++	error = bus_dma_tag_create(sc->sc_pdmatag, 1, 0,
++	    BUS_SPACE_MAXADDR, BUS_SPACE_MAXADDR, NULL, NULL,
++	    MCLBYTES * GEM_NTXSEGS, GEM_NTXSEGS, MCLBYTES,
++	    BUS_DMA_ALLOCNOW, NULL, NULL, &sc->sc_tdmatag);
++	if (error != 0)
++		goto fail_rtag;
++
++	error = bus_dma_tag_create(sc->sc_pdmatag, PAGE_SIZE, 0,
++	    BUS_SPACE_MAXADDR, BUS_SPACE_MAXADDR, NULL, NULL,
++	    sizeof(struct gem_control_data), 1,
++	    sizeof(struct gem_control_data), 0,
++	    NULL, NULL, &sc->sc_cdmatag);
++	if (error != 0)
++		goto fail_ttag;
++
++	/*
++	 * Allocate the control data structures, create and load the
++	 * DMA map for it.
++	 */
++	if ((error = bus_dmamem_alloc(sc->sc_cdmatag,
++	    (void **)&sc->sc_control_data,
++	    BUS_DMA_WAITOK | BUS_DMA_COHERENT | BUS_DMA_ZERO,
++	    &sc->sc_cddmamap)) != 0) {
++		device_printf(sc->sc_dev,
++		    "unable to allocate control data, error = %d\n", error);
++		goto fail_ctag;
++	}
++
++	sc->sc_cddma = 0;
++	if ((error = bus_dmamap_load(sc->sc_cdmatag, sc->sc_cddmamap,
++	    sc->sc_control_data, sizeof(struct gem_control_data),
++	    gem_cddma_callback, sc, 0)) != 0 || sc->sc_cddma == 0) {
++		device_printf(sc->sc_dev,
++		    "unable to load control data DMA map, error = %d\n",
++		    error);
++		goto fail_cmem;
++	}
++
++	/*
++	 * Initialize the transmit job descriptors.
++	 */
++	STAILQ_INIT(&sc->sc_txfreeq);
++	STAILQ_INIT(&sc->sc_txdirtyq);
++
++	/*
++	 * Create the transmit buffer DMA maps.
++	 */
++	error = ENOMEM;
++	for (i = 0; i < GEM_TXQUEUELEN; i++) {
++		txs = &sc->sc_txsoft[i];
++		txs->txs_mbuf = NULL;
++		txs->txs_ndescs = 0;
++		if ((error = bus_dmamap_create(sc->sc_tdmatag, 0,
++		    &txs->txs_dmamap)) != 0) {
++			device_printf(sc->sc_dev,
++			    "unable to create TX DMA map %d, error = %d\n",
++			    i, error);
++			goto fail_txd;
++		}
++		STAILQ_INSERT_TAIL(&sc->sc_txfreeq, txs, txs_q);
++	}
++
++	/*
++	 * Create the receive buffer DMA maps.
++	 */
++	for (i = 0; i < GEM_NRXDESC; i++) {
++		if ((error = bus_dmamap_create(sc->sc_rdmatag, 0,
++		    &sc->sc_rxsoft[i].rxs_dmamap)) != 0) {
++			device_printf(sc->sc_dev,
++			    "unable to create RX DMA map %d, error = %d\n",
++			    i, error);
++			goto fail_rxd;
++		}
++		sc->sc_rxsoft[i].rxs_mbuf = NULL;
++	}
++
++	/* Bypass probing PHYs if we already know for sure to use a SERDES. */
++	if ((sc->sc_flags & GEM_SERDES) != 0)
++		goto serdes;
++
++	GEM_WRITE_4(sc, GEM_MII_DATAPATH_MODE, GEM_MII_DATAPATH_MII);
++	GEM_BARRIER(sc, GEM_MII_DATAPATH_MODE, 4,
++	    BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);
++
++	gem_mifinit(sc);
++
++	/*
++	 * Look for an external PHY.
++	 */
++	error = ENXIO;
++	v = GEM_READ_4(sc, GEM_MIF_CONFIG);
++	if ((v & GEM_MIF_CONFIG_MDI1) != 0) {
++		v |= GEM_MIF_CONFIG_PHY_SEL;
++		GEM_WRITE_4(sc, GEM_MIF_CONFIG, v);
++		GEM_BARRIER(sc, GEM_MIF_CONFIG, 4,
++		    BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);
++		error = mii_attach(sc->sc_dev, &sc->sc_miibus, ifp,
++		    gem_mediachange, gem_mediastatus, BMSR_DEFCAPMASK,
++		    MII_PHY_ANY, MII_OFFSET_ANY, MIIF_DOPAUSE);
++	}
++
++	/*
++	 * Fall back on an internal PHY if no external PHY was found.
++	 * Note that with Apple (K2) GMACs GEM_MIF_CONFIG_MDI0 can't be
++	 * trusted when the firmware has powered down the chip.
++	 */
++	if (error != 0 &&
++	    ((v & GEM_MIF_CONFIG_MDI0) != 0 || GEM_IS_APPLE(sc))) {
++		v &= ~GEM_MIF_CONFIG_PHY_SEL;
++		GEM_WRITE_4(sc, GEM_MIF_CONFIG, v);
++		GEM_BARRIER(sc, GEM_MIF_CONFIG, 4,
++		    BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);
++		switch (sc->sc_variant) {
++		case GEM_APPLE_K2_GMAC:
++			phy = GEM_PHYAD_INTERNAL;
++			break;
++		case GEM_APPLE_GMAC:
++			phy = GEM_PHYAD_EXTERNAL;
++			break;
++		default:
++			phy = MII_PHY_ANY;
++			break;
++		}
++		error = mii_attach(sc->sc_dev, &sc->sc_miibus, ifp,
++		    gem_mediachange, gem_mediastatus, BMSR_DEFCAPMASK, phy,
++		    MII_OFFSET_ANY, MIIF_DOPAUSE);
++	}
++
++	/*
++	 * Try the external PCS SERDES if we didn't find any PHYs.
++	 */
++	if (error != 0 && sc->sc_variant == GEM_SUN_GEM) {
++ serdes:
++		GEM_WRITE_4(sc, GEM_MII_DATAPATH_MODE,
++		    GEM_MII_DATAPATH_SERDES);
++		GEM_BARRIER(sc, GEM_MII_DATAPATH_MODE, 4,
++		    BUS_SPACE_BARRIER_WRITE);
++		GEM_WRITE_4(sc, GEM_MII_SLINK_CONTROL,
++		    GEM_MII_SLINK_LOOPBACK | GEM_MII_SLINK_EN_SYNC_D);
++		GEM_BARRIER(sc, GEM_MII_SLINK_CONTROL, 4,
++		    BUS_SPACE_BARRIER_WRITE);
++		GEM_WRITE_4(sc, GEM_MII_CONFIG, GEM_MII_CONFIG_ENABLE);
++		GEM_BARRIER(sc, GEM_MII_CONFIG, 4,
++		    BUS_SPACE_BARRIER_WRITE);
++		sc->sc_flags |= GEM_SERDES;
++		error = mii_attach(sc->sc_dev, &sc->sc_miibus, ifp,
++		    gem_mediachange, gem_mediastatus, BMSR_DEFCAPMASK,
++		    GEM_PHYAD_EXTERNAL, MII_OFFSET_ANY, MIIF_DOPAUSE);
++	}
++	if (error != 0) {
++		device_printf(sc->sc_dev, "attaching PHYs failed\n");
++		goto fail_rxd;
++	}
++	sc->sc_mii = device_get_softc(sc->sc_miibus);
++
++	/*
++	 * From this point forward, the attachment cannot fail.  A failure
++	 * before this point releases all resources that may have been
++	 * allocated.
++	 */
++
++	/* Get RX FIFO size. */
++	sc->sc_rxfifosize = 64 *
++	    GEM_READ_4(sc, GEM_RX_FIFO_SIZE);
++
++	/* Get TX FIFO size. */
++	v = GEM_READ_4(sc, GEM_TX_FIFO_SIZE);
++	device_printf(sc->sc_dev, "%ukB RX FIFO, %ukB TX FIFO\n",
++	    sc->sc_rxfifosize / 1024, v / 16);
++
++	/* Attach the interface. */
++	ether_ifattach(ifp, sc->sc_enaddr);
++
++	/*
++	 * Tell the upper layer(s) we support long frames/checksum offloads.
++	 */
++	if_setifheaderlen(ifp, sizeof(struct ether_vlan_header));
++	if_setcapabilitiesbit(ifp, IFCAP_VLAN_MTU | IFCAP_HWCSUM, 0);
++	if_sethwassistbits(ifp, sc->sc_csum_features, 0);
++	if_setcapenablebit(ifp, IFCAP_VLAN_MTU | IFCAP_HWCSUM, 0);
++
++	return (0);
++
++	/*
++	 * Free any resources we've allocated during the failed attach
++	 * attempt.  Do this in reverse order and fall through.
++	 */
++ fail_rxd:
++	for (i = 0; i < GEM_NRXDESC; i++)
++		if (sc->sc_rxsoft[i].rxs_dmamap != NULL)
++			bus_dmamap_destroy(sc->sc_rdmatag,
++			    sc->sc_rxsoft[i].rxs_dmamap);
++ fail_txd:
++	for (i = 0; i < GEM_TXQUEUELEN; i++)
++		if (sc->sc_txsoft[i].txs_dmamap != NULL)
++			bus_dmamap_destroy(sc->sc_tdmatag,
++			    sc->sc_txsoft[i].txs_dmamap);
++	bus_dmamap_unload(sc->sc_cdmatag, sc->sc_cddmamap);
++ fail_cmem:
++	bus_dmamem_free(sc->sc_cdmatag, sc->sc_control_data,
++	    sc->sc_cddmamap);
++ fail_ctag:
++	bus_dma_tag_destroy(sc->sc_cdmatag);
++ fail_ttag:
++	bus_dma_tag_destroy(sc->sc_tdmatag);
++ fail_rtag:
++	bus_dma_tag_destroy(sc->sc_rdmatag);
++ fail_ptag:
++	bus_dma_tag_destroy(sc->sc_pdmatag);
++ fail_ifnet:
++	if_free(ifp);
++	return (error);
++}
++
++void
++gem_detach(struct gem_softc *sc)
++{
++	if_t ifp = sc->sc_ifp;
++	int i;
++
++	ether_ifdetach(ifp);
++	GEM_LOCK(sc);
++	gem_stop(ifp, 1);
++	GEM_UNLOCK(sc);
++	callout_drain(&sc->sc_tick_ch);
++#ifdef GEM_RINT_TIMEOUT
++	callout_drain(&sc->sc_rx_ch);
++#endif
++	if_free(ifp);
++	device_delete_child(sc->sc_dev, sc->sc_miibus);
++
++	for (i = 0; i < GEM_NRXDESC; i++)
++		if (sc->sc_rxsoft[i].rxs_dmamap != NULL)
++			bus_dmamap_destroy(sc->sc_rdmatag,
++			    sc->sc_rxsoft[i].rxs_dmamap);
++	for (i = 0; i < GEM_TXQUEUELEN; i++)
++		if (sc->sc_txsoft[i].txs_dmamap != NULL)
++			bus_dmamap_destroy(sc->sc_tdmatag,
++			    sc->sc_txsoft[i].txs_dmamap);
++	GEM_CDSYNC(sc, BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
++	bus_dmamap_unload(sc->sc_cdmatag, sc->sc_cddmamap);
++	bus_dmamem_free(sc->sc_cdmatag, sc->sc_control_data,
++	    sc->sc_cddmamap);
++	bus_dma_tag_destroy(sc->sc_cdmatag);
++	bus_dma_tag_destroy(sc->sc_tdmatag);
++	bus_dma_tag_destroy(sc->sc_rdmatag);
++	bus_dma_tag_destroy(sc->sc_pdmatag);
++}
++
++void
++gem_suspend(struct gem_softc *sc)
++{
++	if_t ifp = sc->sc_ifp;
++
++	GEM_LOCK(sc);
++	gem_stop(ifp, 0);
++	GEM_UNLOCK(sc);
++}
++
++void
++gem_resume(struct gem_softc *sc)
++{
++	if_t ifp = sc->sc_ifp;
++
++	GEM_LOCK(sc);
++	/*
++	 * On resume all registers have to be initialized again like
++	 * after power-on.
++	 */
++	sc->sc_flags &= ~GEM_INITED;
++	if (if_getflags(ifp) & IFF_UP)
++		gem_init_locked(sc);
++	GEM_UNLOCK(sc);
++}
++
++static inline void
++gem_rxcksum(struct mbuf *m, uint64_t flags)
++{
++	struct ether_header *eh;
++	struct ip *ip;
++	struct udphdr *uh;
++	uint16_t *opts;
++	int32_t hlen, len, pktlen;
++	uint32_t temp32;
++	uint16_t cksum;
++
++	pktlen = m->m_pkthdr.len;
++	if (pktlen < sizeof(struct ether_header) + sizeof(struct ip))
++		return;
++	eh = mtod(m, struct ether_header *);
++	if (eh->ether_type != htons(ETHERTYPE_IP))
++		return;
++	ip = (struct ip *)(eh + 1);
++	if (ip->ip_v != IPVERSION)
++		return;
++
++	hlen = ip->ip_hl << 2;
++	pktlen -= sizeof(struct ether_header);
++	if (hlen < sizeof(struct ip))
++		return;
++	if (ntohs(ip->ip_len) < hlen)
++		return;
++	if (ntohs(ip->ip_len) != pktlen)
++		return;
++	if (ip->ip_off & htons(IP_MF | IP_OFFMASK))
++		return;	/* Cannot handle fragmented packet. */
++
++	switch (ip->ip_p) {
++	case IPPROTO_TCP:
++		if (pktlen < (hlen + sizeof(struct tcphdr)))
++			return;
++		break;
++	case IPPROTO_UDP:
++		if (pktlen < (hlen + sizeof(struct udphdr)))
++			return;
++		uh = (struct udphdr *)((uint8_t *)ip + hlen);
++		if (uh->uh_sum == 0)
++			return; /* no checksum */
++		break;
++	default:
++		return;
++	}
++
++	cksum = ~(flags & GEM_RD_CHECKSUM);
++	/* checksum fixup for IP options */
++	len = hlen - sizeof(struct ip);
++	if (len > 0) {
++		opts = (uint16_t *)(ip + 1);
++		for (; len > 0; len -= sizeof(uint16_t), opts++) {
++			temp32 = cksum - *opts;
++			temp32 = (temp32 >> 16) + (temp32 & 65535);
++			cksum = temp32 & 65535;
++		}
++	}
++	m->m_pkthdr.csum_flags |= CSUM_DATA_VALID;
++	m->m_pkthdr.csum_data = cksum;
++}
++
++static void
++gem_cddma_callback(void *xsc, bus_dma_segment_t *segs, int nsegs, int error)
++{
++	struct gem_softc *sc = xsc;
++
++	if (error != 0)
++		return;
++	if (nsegs != 1)
++		panic("%s: bad control buffer segment count", __func__);
++	sc->sc_cddma = segs[0].ds_addr;
++}
++
++static void
++gem_tick(void *arg)
++{
++	struct gem_softc *sc = arg;
++	if_t ifp = sc->sc_ifp;
++	uint32_t v;
++
++	GEM_LOCK_ASSERT(sc, MA_OWNED);
++
++	/*
++	 * Unload collision and error counters.
++	 */
++	if_inc_counter(ifp, IFCOUNTER_COLLISIONS,
++	    GEM_READ_4(sc, GEM_MAC_NORM_COLL_CNT) +
++	    GEM_READ_4(sc, GEM_MAC_FIRST_COLL_CNT));
++	v = GEM_READ_4(sc, GEM_MAC_EXCESS_COLL_CNT) +
++	    GEM_READ_4(sc, GEM_MAC_LATE_COLL_CNT);
++	if_inc_counter(ifp, IFCOUNTER_COLLISIONS, v);
++	if_inc_counter(ifp, IFCOUNTER_OERRORS, v);
++	if_inc_counter(ifp, IFCOUNTER_IERRORS,
++	    GEM_READ_4(sc, GEM_MAC_RX_LEN_ERR_CNT) +
++	    GEM_READ_4(sc, GEM_MAC_RX_ALIGN_ERR) +
++	    GEM_READ_4(sc, GEM_MAC_RX_CRC_ERR_CNT) +
++	    GEM_READ_4(sc, GEM_MAC_RX_CODE_VIOL));
++
++	/*
++	 * Then clear the hardware counters.
++	 */
++	GEM_WRITE_4(sc, GEM_MAC_NORM_COLL_CNT, 0);
++	GEM_WRITE_4(sc, GEM_MAC_FIRST_COLL_CNT, 0);
++	GEM_WRITE_4(sc, GEM_MAC_EXCESS_COLL_CNT, 0);
++	GEM_WRITE_4(sc, GEM_MAC_LATE_COLL_CNT, 0);
++	GEM_WRITE_4(sc, GEM_MAC_RX_LEN_ERR_CNT, 0);
++	GEM_WRITE_4(sc, GEM_MAC_RX_ALIGN_ERR, 0);
++	GEM_WRITE_4(sc, GEM_MAC_RX_CRC_ERR_CNT, 0);
++	GEM_WRITE_4(sc, GEM_MAC_RX_CODE_VIOL, 0);
++
++	mii_tick(sc->sc_mii);
++
++	if (gem_watchdog(sc) == EJUSTRETURN)
++		return;
++
++	callout_reset(&sc->sc_tick_ch, hz, gem_tick, sc);
++}
++
++static int
++gem_bitwait(struct gem_softc *sc, bus_addr_t r, uint32_t clr, uint32_t set)
++{
++	int i;
++	uint32_t reg;
++
++	for (i = GEM_TRIES; i--; DELAY(100)) {
++		reg = GEM_READ_4(sc, r);
++		if ((reg & clr) == 0 && (reg & set) == set)
++			return (1);
++	}
++	return (0);
++}
++
++static void
++gem_reset(struct gem_softc *sc)
++{
++
++#ifdef GEM_DEBUG
++	CTR2(KTR_GEM, "%s: %s", device_get_name(sc->sc_dev), __func__);
++#endif
++	gem_reset_rx(sc);
++	gem_reset_tx(sc);
++
++	/* Do a full reset. */
++	GEM_WRITE_4(sc, GEM_RESET, GEM_RESET_RX | GEM_RESET_TX);
++	GEM_BARRIER(sc, GEM_RESET, 4,
++	    BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);
++	if (!gem_bitwait(sc, GEM_RESET, GEM_RESET_RX | GEM_RESET_TX, 0))
++		device_printf(sc->sc_dev, "cannot reset device\n");
++}
++
++static void
++gem_rxdrain(struct gem_softc *sc)
++{
++	struct gem_rxsoft *rxs;
++	int i;
++
++	for (i = 0; i < GEM_NRXDESC; i++) {
++		rxs = &sc->sc_rxsoft[i];
++		if (rxs->rxs_mbuf != NULL) {
++			bus_dmamap_sync(sc->sc_rdmatag, rxs->rxs_dmamap,
++			    BUS_DMASYNC_POSTREAD);
++			bus_dmamap_unload(sc->sc_rdmatag, rxs->rxs_dmamap);
++			m_freem(rxs->rxs_mbuf);
++			rxs->rxs_mbuf = NULL;
++		}
++	}
++}
++
++static void
++gem_stop(if_t ifp, int disable)
++{
++	struct gem_softc *sc = if_getsoftc(ifp);
++	struct gem_txsoft *txs;
++
++#ifdef GEM_DEBUG
++	CTR2(KTR_GEM, "%s: %s", device_get_name(sc->sc_dev), __func__);
++#endif
++
++	callout_stop(&sc->sc_tick_ch);
++#ifdef GEM_RINT_TIMEOUT
++	callout_stop(&sc->sc_rx_ch);
++#endif
++
++	gem_reset_tx(sc);
++	gem_reset_rx(sc);
++
++	/*
++	 * Release any queued transmit buffers.
++	 */
++	while ((txs = STAILQ_FIRST(&sc->sc_txdirtyq)) != NULL) {
++		STAILQ_REMOVE_HEAD(&sc->sc_txdirtyq, txs_q);
++		if (txs->txs_ndescs != 0) {
++			bus_dmamap_sync(sc->sc_tdmatag, txs->txs_dmamap,
++			    BUS_DMASYNC_POSTWRITE);
++			bus_dmamap_unload(sc->sc_tdmatag, txs->txs_dmamap);
++			if (txs->txs_mbuf != NULL) {
++				m_freem(txs->txs_mbuf);
++				txs->txs_mbuf = NULL;
++			}
++		}
++		STAILQ_INSERT_TAIL(&sc->sc_txfreeq, txs, txs_q);
++	}
++
++	if (disable)
++		gem_rxdrain(sc);
++
++	/*
++	 * Mark the interface down and cancel the watchdog timer.
++	 */
++	if_setdrvflagbits(ifp, 0, (IFF_DRV_RUNNING | IFF_DRV_OACTIVE));
++	sc->sc_flags &= ~GEM_LINK;
++	sc->sc_wdog_timer = 0;
++}
++
++static int
++gem_reset_rx(struct gem_softc *sc)
++{
++
++	/*
++	 * Resetting while DMA is in progress can cause a bus hang, so we
++	 * disable DMA first.
++	 */
++	(void)gem_disable_rx(sc);
++	GEM_WRITE_4(sc, GEM_RX_CONFIG, 0);
++	GEM_BARRIER(sc, GEM_RX_CONFIG, 4,
++	    BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);
++	if (!gem_bitwait(sc, GEM_RX_CONFIG, GEM_RX_CONFIG_RXDMA_EN, 0))
++		device_printf(sc->sc_dev, "cannot disable RX DMA\n");
++
++	/* Wait 5ms extra. */
++	DELAY(5000);
++
++	/* Reset the ERX. */
++	GEM_WRITE_4(sc, GEM_RESET, GEM_RESET_RX);
++	GEM_BARRIER(sc, GEM_RESET, 4,
++	    BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);
++	if (!gem_bitwait(sc, GEM_RESET, GEM_RESET_RX, 0)) {
++		device_printf(sc->sc_dev, "cannot reset receiver\n");
++		return (1);
++	}
++
++	/* Finally, reset RX MAC. */
++	GEM_WRITE_4(sc, GEM_MAC_RXRESET, 1);
++	GEM_BARRIER(sc, GEM_MAC_RXRESET, 4,
++	    BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);
++	if (!gem_bitwait(sc, GEM_MAC_RXRESET, 1, 0)) {
++		device_printf(sc->sc_dev, "cannot reset RX MAC\n");
++		return (1);
++	}
++
++	return (0);
++}
++
++/*
++ * Reset the receiver DMA engine.
++ *
++ * Intended to be used in case of GEM_INTR_RX_TAG_ERR, GEM_MAC_RX_OVERFLOW
++ * etc in order to reset the receiver DMA engine only and not do a full
++ * reset which amongst others also downs the link and clears the FIFOs.
++ */
++static void
++gem_reset_rxdma(struct gem_softc *sc)
++{
++	int i;
++
++	if (gem_reset_rx(sc) != 0) {
++		if_setdrvflagbits(sc->sc_ifp, 0, IFF_DRV_RUNNING);
++		return (gem_init_locked(sc));
++	}
++	for (i = 0; i < GEM_NRXDESC; i++)
++		if (sc->sc_rxsoft[i].rxs_mbuf != NULL)
++			GEM_UPDATE_RXDESC(sc, i);
++	sc->sc_rxptr = 0;
++	GEM_CDSYNC(sc, BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
++
++	/* NOTE: we use only 32-bit DMA addresses here. */
++	GEM_WRITE_4(sc, GEM_RX_RING_PTR_HI, 0);
++	GEM_WRITE_4(sc, GEM_RX_RING_PTR_LO, GEM_CDRXADDR(sc, 0));
++	GEM_WRITE_4(sc, GEM_RX_KICK, GEM_NRXDESC - 4);
++	GEM_WRITE_4(sc, GEM_RX_CONFIG,
++	    gem_ringsize(GEM_NRXDESC /* XXX */) |
++	    ((ETHER_HDR_LEN + sizeof(struct ip)) <<
++	    GEM_RX_CONFIG_CXM_START_SHFT) |
++	    (GEM_THRSH_1024 << GEM_RX_CONFIG_FIFO_THRS_SHIFT) |
++	    (ETHER_ALIGN << GEM_RX_CONFIG_FBOFF_SHFT));
++	GEM_WRITE_4(sc, GEM_RX_BLANKING,
++	    ((6 * (sc->sc_flags & GEM_PCI66) != 0 ? 2 : 1) <<
++	    GEM_RX_BLANKING_TIME_SHIFT) | 6);
++	GEM_WRITE_4(sc, GEM_RX_PAUSE_THRESH,
++	    (3 * sc->sc_rxfifosize / 256) |
++	    ((sc->sc_rxfifosize / 256) << 12));
++	GEM_WRITE_4(sc, GEM_RX_CONFIG,
++	    GEM_READ_4(sc, GEM_RX_CONFIG) | GEM_RX_CONFIG_RXDMA_EN);
++	GEM_WRITE_4(sc, GEM_MAC_RX_MASK,
++	    GEM_MAC_RX_DONE | GEM_MAC_RX_FRAME_CNT);
++	/*
++	 * Clear the RX filter and reprogram it.  This will also set the
++	 * current RX MAC configuration and enable it.
++	 */
++	gem_setladrf(sc);
++}
++
++static int
++gem_reset_tx(struct gem_softc *sc)
++{
++
++	/*
++	 * Resetting while DMA is in progress can cause a bus hang, so we
++	 * disable DMA first.
++	 */
++	(void)gem_disable_tx(sc);
++	GEM_WRITE_4(sc, GEM_TX_CONFIG, 0);
++	GEM_BARRIER(sc, GEM_TX_CONFIG, 4,
++	    BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);
++	if (!gem_bitwait(sc, GEM_TX_CONFIG, GEM_TX_CONFIG_TXDMA_EN, 0))
++		device_printf(sc->sc_dev, "cannot disable TX DMA\n");
++
++	/* Wait 5ms extra. */
++	DELAY(5000);
++
++	/* Finally, reset the ETX. */
++	GEM_WRITE_4(sc, GEM_RESET, GEM_RESET_TX);
++	GEM_BARRIER(sc, GEM_RESET, 4,
++	    BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);
++	if (!gem_bitwait(sc, GEM_RESET, GEM_RESET_TX, 0)) {
++		device_printf(sc->sc_dev, "cannot reset transmitter\n");
++		return (1);
++	}
++	return (0);
++}
++
++static int
++gem_disable_rx(struct gem_softc *sc)
++{
++
++	GEM_WRITE_4(sc, GEM_MAC_RX_CONFIG,
++	    GEM_READ_4(sc, GEM_MAC_RX_CONFIG) & ~GEM_MAC_RX_ENABLE);
++	GEM_BARRIER(sc, GEM_MAC_RX_CONFIG, 4,
++	    BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);
++	if (gem_bitwait(sc, GEM_MAC_RX_CONFIG, GEM_MAC_RX_ENABLE, 0))
++		return (1);
++	device_printf(sc->sc_dev, "cannot disable RX MAC\n");
++	return (0);
++}
++
++static int
++gem_disable_tx(struct gem_softc *sc)
++{
++
++	GEM_WRITE_4(sc, GEM_MAC_TX_CONFIG,
++	    GEM_READ_4(sc, GEM_MAC_TX_CONFIG) & ~GEM_MAC_TX_ENABLE);
++	GEM_BARRIER(sc, GEM_MAC_TX_CONFIG, 4,
++	    BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);
++	if (gem_bitwait(sc, GEM_MAC_TX_CONFIG, GEM_MAC_TX_ENABLE, 0))
++		return (1);
++	device_printf(sc->sc_dev, "cannot disable TX MAC\n");
++	return (0);
++}
++
++static int
++gem_meminit(struct gem_softc *sc)
++{
++	struct gem_rxsoft *rxs;
++	int error, i;
++
++	GEM_LOCK_ASSERT(sc, MA_OWNED);
++
++	/*
++	 * Initialize the transmit descriptor ring.
++	 */
++	for (i = 0; i < GEM_NTXDESC; i++) {
++		sc->sc_txdescs[i].gd_flags = 0;
++		sc->sc_txdescs[i].gd_addr = 0;
++	}
++	sc->sc_txfree = GEM_MAXTXFREE;
++	sc->sc_txnext = 0;
++	sc->sc_txwin = 0;
++
++	/*
++	 * Initialize the receive descriptor and receive job
++	 * descriptor rings.
++	 */
++	for (i = 0; i < GEM_NRXDESC; i++) {
++		rxs = &sc->sc_rxsoft[i];
++		if (rxs->rxs_mbuf == NULL) {
++			if ((error = gem_add_rxbuf(sc, i)) != 0) {
++				device_printf(sc->sc_dev,
++				    "unable to allocate or map RX buffer %d, "
++				    "error = %d\n", i, error);
++				/*
++				 * XXX we should attempt to run with fewer
++				 * receive buffers instead of just failing.
++				 */
++				gem_rxdrain(sc);
++				return (1);
++			}
++		} else
++			GEM_INIT_RXDESC(sc, i);
++	}
++	sc->sc_rxptr = 0;
++
++	GEM_CDSYNC(sc, BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
++
++	return (0);
++}
++
++static u_int
++gem_ringsize(u_int sz)
++{
++
++	switch (sz) {
++	case 32:
++		return (GEM_RING_SZ_32);
++	case 64:
++		return (GEM_RING_SZ_64);
++	case 128:
++		return (GEM_RING_SZ_128);
++	case 256:
++		return (GEM_RING_SZ_256);
++	case 512:
++		return (GEM_RING_SZ_512);
++	case 1024:
++		return (GEM_RING_SZ_1024);
++	case 2048:
++		return (GEM_RING_SZ_2048);
++	case 4096:
++		return (GEM_RING_SZ_4096);
++	case 8192:
++		return (GEM_RING_SZ_8192);
++	default:
++		printf("%s: invalid ring size %d\n", __func__, sz);
++		return (GEM_RING_SZ_32);
++	}
++}
++
++static void
++gem_init(void *xsc)
++{
++	struct gem_softc *sc = xsc;
++
++	GEM_LOCK(sc);
++	gem_init_locked(sc);
++	GEM_UNLOCK(sc);
++}
++
++/*
++ * Initialization of interface; set up initialization block
++ * and transmit/receive descriptor rings.
++ */
++static void
++gem_init_locked(struct gem_softc *sc)
++{
++	if_t ifp = sc->sc_ifp;
++	uint32_t v;
++
++	GEM_LOCK_ASSERT(sc, MA_OWNED);
++
++	if ((if_getdrvflags(ifp) & IFF_DRV_RUNNING) != 0)
++		return;
++
++#ifdef GEM_DEBUG
++	CTR2(KTR_GEM, "%s: %s: calling stop", device_get_name(sc->sc_dev),
++	    __func__);
++#endif
++	/*
++	 * Initialization sequence.  The numbered steps below correspond
++	 * to the sequence outlined in section 6.3.5.1 in the Ethernet
++	 * Channel Engine manual (part of the PCIO manual).
++	 * See also the STP2002-STQ document from Sun Microsystems.
++	 */
++
++	/* step 1 & 2.  Reset the Ethernet Channel. */
++	gem_stop(ifp, 0);
++	gem_reset(sc);
++#ifdef GEM_DEBUG
++	CTR2(KTR_GEM, "%s: %s: restarting", device_get_name(sc->sc_dev),
++	    __func__);
++#endif
++
++	if ((sc->sc_flags & GEM_SERDES) == 0)
++		/* Re-initialize the MIF. */
++		gem_mifinit(sc);
++
++	/* step 3.  Setup data structures in host memory. */
++	if (gem_meminit(sc) != 0)
++		return;
++
++	/* step 4.  TX MAC registers & counters */
++	gem_init_regs(sc);
++
++	/* step 5.  RX MAC registers & counters */
++
++	/* step 6 & 7.  Program Descriptor Ring Base Addresses. */
++	/* NOTE: we use only 32-bit DMA addresses here. */
++	GEM_WRITE_4(sc, GEM_TX_RING_PTR_HI, 0);
++	GEM_WRITE_4(sc, GEM_TX_RING_PTR_LO, GEM_CDTXADDR(sc, 0));
++
++	GEM_WRITE_4(sc, GEM_RX_RING_PTR_HI, 0);
++	GEM_WRITE_4(sc, GEM_RX_RING_PTR_LO, GEM_CDRXADDR(sc, 0));
++#ifdef GEM_DEBUG
++	CTR3(KTR_GEM, "loading RX ring %lx, TX ring %lx, cddma %lx",
++	    GEM_CDRXADDR(sc, 0), GEM_CDTXADDR(sc, 0), sc->sc_cddma);
++#endif
++
++	/* step 8.  Global Configuration & Interrupt Mask */
++
++	/*
++	 * Set the internal arbitration to "infinite" bursts of the
++	 * maximum length of 31 * 64 bytes so DMA transfers aren't
++	 * split up in cache line size chunks.  This greatly improves
++	 * RX performance.
++	 * Enable silicon bug workarounds for the Apple variants.
++	 */
++	GEM_WRITE_4(sc, GEM_CONFIG,
++	    GEM_CONFIG_TXDMA_LIMIT | GEM_CONFIG_RXDMA_LIMIT |
++	    GEM_CONFIG_BURST_INF | (GEM_IS_APPLE(sc) ?
++	    GEM_CONFIG_RONPAULBIT | GEM_CONFIG_BUG2FIX : 0));
++
++	GEM_WRITE_4(sc, GEM_INTMASK,
++	    ~(GEM_INTR_TX_INTME | GEM_INTR_TX_EMPTY | GEM_INTR_RX_DONE |
++	    GEM_INTR_RX_NOBUF | GEM_INTR_RX_TAG_ERR | GEM_INTR_PERR |
++	    GEM_INTR_BERR
++#ifdef GEM_DEBUG
++	    | GEM_INTR_PCS | GEM_INTR_MIF
++#endif
++	    ));
++	GEM_WRITE_4(sc, GEM_MAC_RX_MASK,
++	    GEM_MAC_RX_DONE | GEM_MAC_RX_FRAME_CNT);
++	GEM_WRITE_4(sc, GEM_MAC_TX_MASK,
++	    GEM_MAC_TX_XMIT_DONE | GEM_MAC_TX_DEFER_EXP |
++	    GEM_MAC_TX_PEAK_EXP);
++#ifdef GEM_DEBUG
++	GEM_WRITE_4(sc, GEM_MAC_CONTROL_MASK,
++	    ~(GEM_MAC_PAUSED | GEM_MAC_PAUSE | GEM_MAC_RESUME));
++#else
++	GEM_WRITE_4(sc, GEM_MAC_CONTROL_MASK,
++	    GEM_MAC_PAUSED | GEM_MAC_PAUSE | GEM_MAC_RESUME);
++#endif
++
++	/* step 9.  ETX Configuration: use mostly default values. */
++
++	/* Enable DMA. */
++	v = gem_ringsize(GEM_NTXDESC);
++	/* Set TX FIFO threshold and enable DMA. */
++	v |= (0x4ff << 10) & GEM_TX_CONFIG_TXFIFO_TH;
++	GEM_WRITE_4(sc, GEM_TX_CONFIG, v | GEM_TX_CONFIG_TXDMA_EN);
++
++	/* step 10.  ERX Configuration */
++
++	/* Encode Receive Descriptor ring size. */
++	v = gem_ringsize(GEM_NRXDESC /* XXX */);
++	/* RX TCP/UDP checksum offset */
++	v |= ((ETHER_HDR_LEN + sizeof(struct ip)) <<
++	    GEM_RX_CONFIG_CXM_START_SHFT);
++	/* Set RX FIFO threshold, set first byte offset and enable DMA. */
++	GEM_WRITE_4(sc, GEM_RX_CONFIG,
++	    v | (GEM_THRSH_1024 << GEM_RX_CONFIG_FIFO_THRS_SHIFT) |
++	    (ETHER_ALIGN << GEM_RX_CONFIG_FBOFF_SHFT) |
++	    GEM_RX_CONFIG_RXDMA_EN);
++
++	GEM_WRITE_4(sc, GEM_RX_BLANKING,
++	    ((6 * (sc->sc_flags & GEM_PCI66) != 0 ? 2 : 1) <<
++	    GEM_RX_BLANKING_TIME_SHIFT) | 6);
++
++	/*
++	 * The following value is for an OFF Threshold of about 3/4 full
++	 * and an ON Threshold of 1/4 full.
++	 */
++	GEM_WRITE_4(sc, GEM_RX_PAUSE_THRESH,
++	    (3 * sc->sc_rxfifosize / 256) |
++	    ((sc->sc_rxfifosize / 256) << 12));
++
++	/* step 11.  Configure Media. */
++
++	/* step 12.  RX_MAC Configuration Register */
++	v = GEM_READ_4(sc, GEM_MAC_RX_CONFIG);
++	v &= ~GEM_MAC_RX_ENABLE;
++	v |= GEM_MAC_RX_STRIP_CRC;
++	sc->sc_mac_rxcfg = v;
++	/*
++	 * Clear the RX filter and reprogram it.  This will also set the
++	 * current RX MAC configuration and enable it.
++	 */
++	gem_setladrf(sc);
++
++	/* step 13.  TX_MAC Configuration Register */
++	v = GEM_READ_4(sc, GEM_MAC_TX_CONFIG);
++	v |= GEM_MAC_TX_ENABLE;
++	(void)gem_disable_tx(sc);
++	GEM_WRITE_4(sc, GEM_MAC_TX_CONFIG, v);
++
++	/* step 14.  Issue Transmit Pending command. */
++
++	/* step 15.  Give the receiver a swift kick. */
++	GEM_WRITE_4(sc, GEM_RX_KICK, GEM_NRXDESC - 4);
++
++	if_setdrvflagbits(ifp, IFF_DRV_RUNNING, 0);
++	if_setdrvflagbits(ifp, 0, IFF_DRV_OACTIVE);
++
++	mii_mediachg(sc->sc_mii);
++
++	/* Start the one second timer. */
++	sc->sc_wdog_timer = 0;
++	callout_reset(&sc->sc_tick_ch, hz, gem_tick, sc);
++}
++
++static int
++gem_load_txmbuf(struct gem_softc *sc, struct mbuf **m_head)
++{
++	bus_dma_segment_t txsegs[GEM_NTXSEGS];
++	struct gem_txsoft *txs;
++	struct ip *ip;
++	struct mbuf *m;
++	uint64_t cflags, flags;
++	int error, nexttx, nsegs, offset, seg;
++
++	GEM_LOCK_ASSERT(sc, MA_OWNED);
++
++	/* Get a work queue entry. */
++	if ((txs = STAILQ_FIRST(&sc->sc_txfreeq)) == NULL) {
++		/* Ran out of descriptors. */
++		return (ENOBUFS);
++	}
++
++	cflags = 0;
++	if (((*m_head)->m_pkthdr.csum_flags & sc->sc_csum_features) != 0) {
++		if (M_WRITABLE(*m_head) == 0) {
++			m = m_dup(*m_head, M_NOWAIT);
++			m_freem(*m_head);
++			*m_head = m;
++			if (m == NULL)
++				return (ENOBUFS);
++		}
++		offset = sizeof(struct ether_header);
++		m = m_pullup(*m_head, offset + sizeof(struct ip));
++		if (m == NULL) {
++			*m_head = NULL;
++			return (ENOBUFS);
++		}
++		ip = (struct ip *)(mtod(m, caddr_t) + offset);
++		offset += (ip->ip_hl << 2);
++		cflags = offset << GEM_TD_CXSUM_STARTSHFT |
++		    ((offset + m->m_pkthdr.csum_data) <<
++		    GEM_TD_CXSUM_STUFFSHFT) | GEM_TD_CXSUM_ENABLE;
++		*m_head = m;
++	}
++
++	error = bus_dmamap_load_mbuf_sg(sc->sc_tdmatag, txs->txs_dmamap,
++	    *m_head, txsegs, &nsegs, BUS_DMA_NOWAIT);
++	if (error == EFBIG) {
++		m = m_collapse(*m_head, M_NOWAIT, GEM_NTXSEGS);
++		if (m == NULL) {
++			m_freem(*m_head);
++			*m_head = NULL;
++			return (ENOBUFS);
++		}
++		*m_head = m;
++		error = bus_dmamap_load_mbuf_sg(sc->sc_tdmatag,
++		    txs->txs_dmamap, *m_head, txsegs, &nsegs,
++		    BUS_DMA_NOWAIT);
++		if (error != 0) {
++			m_freem(*m_head);
++			*m_head = NULL;
++			return (error);
++		}
++	} else if (error != 0)
++		return (error);
++	/* If nsegs is wrong then the stack is corrupt. */
++	KASSERT(nsegs <= GEM_NTXSEGS,
++	    ("%s: too many DMA segments (%d)", __func__, nsegs));
++	if (nsegs == 0) {
++		m_freem(*m_head);
++		*m_head = NULL;
++		return (EIO);
++	}
++
++	/*
++	 * Ensure we have enough descriptors free to describe
++	 * the packet.  Note, we always reserve one descriptor
++	 * at the end of the ring as a termination point, in
++	 * order to prevent wrap-around.
++	 */
++	if (nsegs > sc->sc_txfree - 1) {
++		txs->txs_ndescs = 0;
++		bus_dmamap_unload(sc->sc_tdmatag, txs->txs_dmamap);
++		return (ENOBUFS);
++	}
++
++	txs->txs_ndescs = nsegs;
++	txs->txs_firstdesc = sc->sc_txnext;
++	nexttx = txs->txs_firstdesc;
++	for (seg = 0; seg < nsegs; seg++, nexttx = GEM_NEXTTX(nexttx)) {
++#ifdef GEM_DEBUG
++		CTR6(KTR_GEM,
++		    "%s: mapping seg %d (txd %d), len %lx, addr %#lx (%#lx)",
++		    __func__, seg, nexttx, txsegs[seg].ds_len,
++		    txsegs[seg].ds_addr, htole64(txsegs[seg].ds_addr));
++#endif
++		sc->sc_txdescs[nexttx].gd_addr = htole64(txsegs[seg].ds_addr);
++		KASSERT(txsegs[seg].ds_len < GEM_TD_BUFSIZE,
++		    ("%s: segment size too large!", __func__));
++		flags = txsegs[seg].ds_len & GEM_TD_BUFSIZE;
++		sc->sc_txdescs[nexttx].gd_flags = htole64(flags | cflags);
++		txs->txs_lastdesc = nexttx;
++	}
++
++	/* Set EOP on the last descriptor. */
++#ifdef GEM_DEBUG
++	CTR3(KTR_GEM, "%s: end of packet at segment %d, TX %d",
++	    __func__, seg, nexttx);
++#endif
++	sc->sc_txdescs[txs->txs_lastdesc].gd_flags |=
++	    htole64(GEM_TD_END_OF_PACKET);
++
++	/* Lastly set SOP on the first descriptor. */
++#ifdef GEM_DEBUG
++	CTR3(KTR_GEM, "%s: start of packet at segment %d, TX %d",
++	    __func__, seg, nexttx);
++#endif
++	if (++sc->sc_txwin > GEM_NTXSEGS * 2 / 3) {
++		sc->sc_txwin = 0;
++		sc->sc_txdescs[txs->txs_firstdesc].gd_flags |=
++		    htole64(GEM_TD_INTERRUPT_ME | GEM_TD_START_OF_PACKET);
++	} else
++		sc->sc_txdescs[txs->txs_firstdesc].gd_flags |=
++		    htole64(GEM_TD_START_OF_PACKET);
++
++	/* Sync the DMA map. */
++	bus_dmamap_sync(sc->sc_tdmatag, txs->txs_dmamap,
++	    BUS_DMASYNC_PREWRITE);
++
++#ifdef GEM_DEBUG
++	CTR4(KTR_GEM, "%s: setting firstdesc=%d, lastdesc=%d, ndescs=%d",
++	    __func__, txs->txs_firstdesc, txs->txs_lastdesc,
++	    txs->txs_ndescs);
++#endif
++	STAILQ_REMOVE_HEAD(&sc->sc_txfreeq, txs_q);
++	STAILQ_INSERT_TAIL(&sc->sc_txdirtyq, txs, txs_q);
++	txs->txs_mbuf = *m_head;
++
++	sc->sc_txnext = GEM_NEXTTX(txs->txs_lastdesc);
++	sc->sc_txfree -= txs->txs_ndescs;
++
++	return (0);
++}
++
++static void
++gem_init_regs(struct gem_softc *sc)
++{
++	const u_char *laddr = if_getlladdr(sc->sc_ifp);
++
++	GEM_LOCK_ASSERT(sc, MA_OWNED);
++
++	/* These registers are not cleared on reset. */
++	if ((sc->sc_flags & GEM_INITED) == 0) {
++		/* magic values */
++		GEM_WRITE_4(sc, GEM_MAC_IPG0, 0);
++		GEM_WRITE_4(sc, GEM_MAC_IPG1, 8);
++		GEM_WRITE_4(sc, GEM_MAC_IPG2, 4);
++
++		/* min frame length */
++		GEM_WRITE_4(sc, GEM_MAC_MAC_MIN_FRAME, ETHER_MIN_LEN);
++		/* max frame length and max burst size */
++		GEM_WRITE_4(sc, GEM_MAC_MAC_MAX_FRAME,
++		    (ETHER_MAX_LEN + ETHER_VLAN_ENCAP_LEN) | (0x2000 << 16));
++
++		/* more magic values */
++		GEM_WRITE_4(sc, GEM_MAC_PREAMBLE_LEN, 0x7);
++		GEM_WRITE_4(sc, GEM_MAC_JAM_SIZE, 0x4);
++		GEM_WRITE_4(sc, GEM_MAC_ATTEMPT_LIMIT, 0x10);
++		GEM_WRITE_4(sc, GEM_MAC_CONTROL_TYPE, 0x8808);
++
++		/* random number seed */
++		GEM_WRITE_4(sc, GEM_MAC_RANDOM_SEED,
++		    ((laddr[5] << 8) | laddr[4]) & 0x3ff);
++
++		/* secondary MAC address: 0:0:0:0:0:0 */
++		GEM_WRITE_4(sc, GEM_MAC_ADDR3, 0);
++		GEM_WRITE_4(sc, GEM_MAC_ADDR4, 0);
++		GEM_WRITE_4(sc, GEM_MAC_ADDR5, 0);
++
++		/* MAC control address: 01:80:c2:00:00:01 */
++		GEM_WRITE_4(sc, GEM_MAC_ADDR6, 0x0001);
++		GEM_WRITE_4(sc, GEM_MAC_ADDR7, 0xc200);
++		GEM_WRITE_4(sc, GEM_MAC_ADDR8, 0x0180);
++
++		/* MAC filter address: 0:0:0:0:0:0 */
++		GEM_WRITE_4(sc, GEM_MAC_ADDR_FILTER0, 0);
++		GEM_WRITE_4(sc, GEM_MAC_ADDR_FILTER1, 0);
++		GEM_WRITE_4(sc, GEM_MAC_ADDR_FILTER2, 0);
++		GEM_WRITE_4(sc, GEM_MAC_ADR_FLT_MASK1_2, 0);
++		GEM_WRITE_4(sc, GEM_MAC_ADR_FLT_MASK0, 0);
++
++		sc->sc_flags |= GEM_INITED;
++	}
++
++	/* Counters need to be zeroed. */
++	GEM_WRITE_4(sc, GEM_MAC_NORM_COLL_CNT, 0);
++	GEM_WRITE_4(sc, GEM_MAC_FIRST_COLL_CNT, 0);
++	GEM_WRITE_4(sc, GEM_MAC_EXCESS_COLL_CNT, 0);
++	GEM_WRITE_4(sc, GEM_MAC_LATE_COLL_CNT, 0);
++	GEM_WRITE_4(sc, GEM_MAC_DEFER_TMR_CNT, 0);
++	GEM_WRITE_4(sc, GEM_MAC_PEAK_ATTEMPTS, 0);
++	GEM_WRITE_4(sc, GEM_MAC_RX_FRAME_COUNT, 0);
++	GEM_WRITE_4(sc, GEM_MAC_RX_LEN_ERR_CNT, 0);
++	GEM_WRITE_4(sc, GEM_MAC_RX_ALIGN_ERR, 0);
++	GEM_WRITE_4(sc, GEM_MAC_RX_CRC_ERR_CNT, 0);
++	GEM_WRITE_4(sc, GEM_MAC_RX_CODE_VIOL, 0);
++
++	/* Set XOFF PAUSE time. */
++	GEM_WRITE_4(sc, GEM_MAC_SEND_PAUSE_CMD, 0x1BF0);
++
++	/* Set the station address. */
++	GEM_WRITE_4(sc, GEM_MAC_ADDR0, (laddr[4] << 8) | laddr[5]);
++	GEM_WRITE_4(sc, GEM_MAC_ADDR1, (laddr[2] << 8) | laddr[3]);
++	GEM_WRITE_4(sc, GEM_MAC_ADDR2, (laddr[0] << 8) | laddr[1]);
++
++	/* Enable MII outputs. */
++	GEM_WRITE_4(sc, GEM_MAC_XIF_CONFIG, GEM_MAC_XIF_TX_MII_ENA);
++}
++
++static void
++gem_start(if_t ifp)
++{
++	struct gem_softc *sc = if_getsoftc(ifp);
++
++	GEM_LOCK(sc);
++	gem_start_locked(ifp);
++	GEM_UNLOCK(sc);
++}
++
++static inline void
++gem_txkick(struct gem_softc *sc)
++{
++
++	/*
++	 * Update the TX kick register.  This register has to point to the
++	 * descriptor after the last valid one and for optimum performance
++	 * should be incremented in multiples of 4 (the DMA engine fetches/
++	 * updates descriptors in batches of 4).
++	 */
++#ifdef GEM_DEBUG
++	CTR3(KTR_GEM, "%s: %s: kicking TX %d",
++	    device_get_name(sc->sc_dev), __func__, sc->sc_txnext);
++#endif
++	GEM_CDSYNC(sc, BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
++	GEM_WRITE_4(sc, GEM_TX_KICK, sc->sc_txnext);
++}
++
++static void
++gem_start_locked(if_t ifp)
++{
++	struct gem_softc *sc = if_getsoftc(ifp);
++	struct mbuf *m;
++	int kicked, ntx;
++
++	GEM_LOCK_ASSERT(sc, MA_OWNED);
++
++	if ((if_getdrvflags(ifp) & (IFF_DRV_RUNNING | IFF_DRV_OACTIVE)) !=
++	    IFF_DRV_RUNNING || (sc->sc_flags & GEM_LINK) == 0)
++		return;
++
++#ifdef GEM_DEBUG
++	CTR4(KTR_GEM, "%s: %s: txfree %d, txnext %d",
++	    device_get_name(sc->sc_dev), __func__, sc->sc_txfree,
++	    sc->sc_txnext);
++#endif
++	ntx = 0;
++	kicked = 0;
++	for (; !if_sendq_empty(ifp) && sc->sc_txfree > 1;) {
++		m = if_dequeue(ifp);
++		if (m == NULL)
++			break;
++		if (gem_load_txmbuf(sc, &m) != 0) {
++			if (m == NULL)
++				break;
++			if_setdrvflagbits(ifp, IFF_DRV_OACTIVE, 0);
++			if_sendq_prepend(ifp, m);
++			break;
++		}
++		if ((sc->sc_txnext % 4) == 0) {
++			gem_txkick(sc);
++			kicked = 1;
++		} else
++			kicked = 0;
++		ntx++;
++		BPF_MTAP(ifp, m);
++	}
++
++	if (ntx > 0) {
++		if (kicked == 0)
++			gem_txkick(sc);
++#ifdef GEM_DEBUG
++		CTR2(KTR_GEM, "%s: packets enqueued, OWN on %d",
++		    device_get_name(sc->sc_dev), sc->sc_txnext);
++#endif
++
++		/* Set a watchdog timer in case the chip flakes out. */
++		sc->sc_wdog_timer = 5;
++#ifdef GEM_DEBUG
++		CTR3(KTR_GEM, "%s: %s: watchdog %d",
++		    device_get_name(sc->sc_dev), __func__,
++		    sc->sc_wdog_timer);
++#endif
++	}
++}
++
++static void
++gem_tint(struct gem_softc *sc)
++{
++	if_t ifp = sc->sc_ifp;
++	struct gem_txsoft *txs;
++	int progress;
++	uint32_t txlast;
++#ifdef GEM_DEBUG
++	int i;
++
++	GEM_LOCK_ASSERT(sc, MA_OWNED);
++
++	CTR2(KTR_GEM, "%s: %s", device_get_name(sc->sc_dev), __func__);
++#endif
++
++	/*
++	 * Go through our TX list and free mbufs for those
++	 * frames that have been transmitted.
++	 */
++	progress = 0;
++	GEM_CDSYNC(sc, BUS_DMASYNC_POSTREAD);
++	while ((txs = STAILQ_FIRST(&sc->sc_txdirtyq)) != NULL) {
++#ifdef GEM_DEBUG
++		if ((if_getflags(ifp) & IFF_DEBUG) != 0) {
++			printf("    txsoft %p transmit chain:\n", txs);
++			for (i = txs->txs_firstdesc;; i = GEM_NEXTTX(i)) {
++				printf("descriptor %d: ", i);
++				printf("gd_flags: 0x%016llx\t",
++				    (long long)le64toh(
++				    sc->sc_txdescs[i].gd_flags));
++				printf("gd_addr: 0x%016llx\n",
++				    (long long)le64toh(
++				    sc->sc_txdescs[i].gd_addr));
++				if (i == txs->txs_lastdesc)
++					break;
++			}
++		}
++#endif
++
++		/*
++		 * In theory, we could harvest some descriptors before
++		 * the ring is empty, but that's a bit complicated.
++		 *
++		 * GEM_TX_COMPLETION points to the last descriptor
++		 * processed + 1.
++		 */
++		txlast = GEM_READ_4(sc, GEM_TX_COMPLETION);
++#ifdef GEM_DEBUG
++		CTR4(KTR_GEM, "%s: txs->txs_firstdesc = %d, "
++		    "txs->txs_lastdesc = %d, txlast = %d",
++		    __func__, txs->txs_firstdesc, txs->txs_lastdesc, txlast);
++#endif
++		if (txs->txs_firstdesc <= txs->txs_lastdesc) {
++			if ((txlast >= txs->txs_firstdesc) &&
++			    (txlast <= txs->txs_lastdesc))
++				break;
++		} else {
++			/* Ick -- this command wraps. */
++			if ((txlast >= txs->txs_firstdesc) ||
++			    (txlast <= txs->txs_lastdesc))
++				break;
++		}
++
++#ifdef GEM_DEBUG
++		CTR1(KTR_GEM, "%s: releasing a descriptor", __func__);
++#endif
++		STAILQ_REMOVE_HEAD(&sc->sc_txdirtyq, txs_q);
++
++		sc->sc_txfree += txs->txs_ndescs;
++
++		bus_dmamap_sync(sc->sc_tdmatag, txs->txs_dmamap,
++		    BUS_DMASYNC_POSTWRITE);
++		bus_dmamap_unload(sc->sc_tdmatag, txs->txs_dmamap);
++		if (txs->txs_mbuf != NULL) {
++			m_freem(txs->txs_mbuf);
++			txs->txs_mbuf = NULL;
++		}
++
++		STAILQ_INSERT_TAIL(&sc->sc_txfreeq, txs, txs_q);
++
++		if_inc_counter(ifp, IFCOUNTER_OPACKETS, 1);
++		progress = 1;
++	}
++
++#ifdef GEM_DEBUG
++	CTR4(KTR_GEM, "%s: GEM_TX_STATE_MACHINE %x GEM_TX_DATA_PTR %llx "
++	    "GEM_TX_COMPLETION %x",
++	    __func__, GEM_READ_4(sc, GEM_TX_STATE_MACHINE),
++	    ((long long)GEM_READ_4(sc, GEM_TX_DATA_PTR_HI) << 32) |
++	    GEM_READ_4(sc, GEM_TX_DATA_PTR_LO),
++	    GEM_READ_4(sc, GEM_TX_COMPLETION));
++#endif
++
++	if (progress) {
++		if (sc->sc_txfree == GEM_NTXDESC - 1)
++			sc->sc_txwin = 0;
++
++		/*
++		 * We freed some descriptors, so reset IFF_DRV_OACTIVE
++		 * and restart.
++		 */
++		if_setdrvflagbits(ifp, 0, IFF_DRV_OACTIVE);
++		if (STAILQ_EMPTY(&sc->sc_txdirtyq))
++		    sc->sc_wdog_timer = 0;
++		gem_start_locked(ifp);
++	}
++
++#ifdef GEM_DEBUG
++	CTR3(KTR_GEM, "%s: %s: watchdog %d",
++	    device_get_name(sc->sc_dev), __func__, sc->sc_wdog_timer);
++#endif
++}
++
++#ifdef GEM_RINT_TIMEOUT
++static void
++gem_rint_timeout(void *arg)
++{
++	struct gem_softc *sc = arg;
++
++	GEM_LOCK_ASSERT(sc, MA_OWNED);
++
++	gem_rint(sc);
++}
++#endif
++
++static void
++gem_rint(struct gem_softc *sc)
++{
++	if_t ifp = sc->sc_ifp;
++	struct mbuf *m;
++	uint64_t rxstat;
++	uint32_t rxcomp;
++
++	GEM_LOCK_ASSERT(sc, MA_OWNED);
++
++#ifdef GEM_RINT_TIMEOUT
++	callout_stop(&sc->sc_rx_ch);
++#endif
++#ifdef GEM_DEBUG
++	CTR2(KTR_GEM, "%s: %s", device_get_name(sc->sc_dev), __func__);
++#endif
++
++	/*
++	 * Read the completion register once.  This limits
++	 * how long the following loop can execute.
++	 */
++	rxcomp = GEM_READ_4(sc, GEM_RX_COMPLETION);
++#ifdef GEM_DEBUG
++	CTR3(KTR_GEM, "%s: sc->sc_rxptr %d, complete %d",
++	    __func__, sc->sc_rxptr, rxcomp);
++#endif
++	GEM_CDSYNC(sc, BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
++	for (; sc->sc_rxptr != rxcomp;) {
++		m = sc->sc_rxsoft[sc->sc_rxptr].rxs_mbuf;
++		rxstat = le64toh(sc->sc_rxdescs[sc->sc_rxptr].gd_flags);
++
++		if (rxstat & GEM_RD_OWN) {
++#ifdef GEM_RINT_TIMEOUT
++			/*
++			 * The descriptor is still marked as owned, although
++			 * it is supposed to have completed.  This has been
++			 * observed on some machines.  Just exiting here
++			 * might leave the packet sitting around until another
++			 * one arrives to trigger a new interrupt, which is
++			 * generally undesirable, so set up a timeout.
++			 */
++			callout_reset(&sc->sc_rx_ch, GEM_RXOWN_TICKS,
++			    gem_rint_timeout, sc);
++#endif
++			m = NULL;
++			goto kickit;
++		}
++
++		if (rxstat & GEM_RD_BAD_CRC) {
++			if_inc_counter(ifp, IFCOUNTER_IERRORS, 1);
++			device_printf(sc->sc_dev, "receive error: CRC error\n");
++			GEM_INIT_RXDESC(sc, sc->sc_rxptr);
++			m = NULL;
++			goto kickit;
++		}
++
++#ifdef GEM_DEBUG
++		if ((if_getflags(ifp) & IFF_DEBUG) != 0) {
++			printf("    rxsoft %p descriptor %d: ",
++			    &sc->sc_rxsoft[sc->sc_rxptr], sc->sc_rxptr);
++			printf("gd_flags: 0x%016llx\t",
++			    (long long)le64toh(
++			    sc->sc_rxdescs[sc->sc_rxptr].gd_flags));
++			printf("gd_addr: 0x%016llx\n",
++			    (long long)le64toh(
++			    sc->sc_rxdescs[sc->sc_rxptr].gd_addr));
++		}
++#endif
++
++		/*
++		 * Allocate a new mbuf cluster.  If that fails, we are
++		 * out of memory, and must drop the packet and recycle
++		 * the buffer that's already attached to this descriptor.
++		 */
++		if (gem_add_rxbuf(sc, sc->sc_rxptr) != 0) {
++			if_inc_counter(ifp, IFCOUNTER_IQDROPS, 1);
++			GEM_INIT_RXDESC(sc, sc->sc_rxptr);
++			m = NULL;
++		}
++
++ kickit:
++		/*
++		 * Update the RX kick register.  This register has to point
++		 * to the descriptor after the last valid one (before the
++		 * current batch) and for optimum performance should be
++		 * incremented in multiples of 4 (the DMA engine fetches/
++		 * updates descriptors in batches of 4).
++		 */
++		sc->sc_rxptr = GEM_NEXTRX(sc->sc_rxptr);
++		if ((sc->sc_rxptr % 4) == 0) {
++			GEM_CDSYNC(sc,
++			    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
++			GEM_WRITE_4(sc, GEM_RX_KICK,
++			    (sc->sc_rxptr + GEM_NRXDESC - 4) &
++			    GEM_NRXDESC_MASK);
++		}
++
++		if (m == NULL) {
++			if (rxstat & GEM_RD_OWN)
++				break;
++			continue;
++		}
++
++		if_inc_counter(ifp, IFCOUNTER_IPACKETS, 1);
++		m->m_data += ETHER_ALIGN; /* first byte offset */
++		m->m_pkthdr.rcvif = ifp;
++		m->m_pkthdr.len = m->m_len = GEM_RD_BUFLEN(rxstat);
++
++		if ((if_getcapenable(ifp) & IFCAP_RXCSUM) != 0)
++			gem_rxcksum(m, rxstat);
++
++		/* Pass it on. */
++		GEM_UNLOCK(sc);
++		if_input(ifp, m);
++		GEM_LOCK(sc);
++	}
++
++#ifdef GEM_DEBUG
++	CTR3(KTR_GEM, "%s: done sc->sc_rxptr %d, complete %d", __func__,
++	    sc->sc_rxptr, GEM_READ_4(sc, GEM_RX_COMPLETION));
++#endif
++}
++
++static int
++gem_add_rxbuf(struct gem_softc *sc, int idx)
++{
++	struct gem_rxsoft *rxs = &sc->sc_rxsoft[idx];
++	struct mbuf *m;
++	bus_dma_segment_t segs[1];
++	int error, nsegs;
++
++	GEM_LOCK_ASSERT(sc, MA_OWNED);
++
++	m = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR);
++	if (m == NULL)
++		return (ENOBUFS);
++	m->m_len = m->m_pkthdr.len = m->m_ext.ext_size;
++
++#ifdef GEM_DEBUG
++	/* Bzero the packet to check DMA. */
++	memset(m->m_ext.ext_buf, 0, m->m_ext.ext_size);
++#endif
++
++	if (rxs->rxs_mbuf != NULL) {
++		bus_dmamap_sync(sc->sc_rdmatag, rxs->rxs_dmamap,
++		    BUS_DMASYNC_POSTREAD);
++		bus_dmamap_unload(sc->sc_rdmatag, rxs->rxs_dmamap);
++	}
++
++	error = bus_dmamap_load_mbuf_sg(sc->sc_rdmatag, rxs->rxs_dmamap,
++	    m, segs, &nsegs, BUS_DMA_NOWAIT);
++	if (error != 0) {
++		device_printf(sc->sc_dev,
++		    "cannot load RS DMA map %d, error = %d\n", idx, error);
++		m_freem(m);
++		return (error);
++	}
++	/* If nsegs is wrong then the stack is corrupt. */
++	KASSERT(nsegs == 1,
++	    ("%s: too many DMA segments (%d)", __func__, nsegs));
++	rxs->rxs_mbuf = m;
++	rxs->rxs_paddr = segs[0].ds_addr;
++
++	bus_dmamap_sync(sc->sc_rdmatag, rxs->rxs_dmamap,
++	    BUS_DMASYNC_PREREAD);
++
++	GEM_INIT_RXDESC(sc, idx);
++
++	return (0);
++}
++
++static void
++gem_eint(struct gem_softc *sc, u_int status)
++{
++
++	if_inc_counter(sc->sc_ifp, IFCOUNTER_IERRORS, 1);
++	if ((status & GEM_INTR_RX_TAG_ERR) != 0) {
++		gem_reset_rxdma(sc);
++		return;
++	}
++
++	device_printf(sc->sc_dev, "%s: status 0x%x", __func__, status);
++	if ((status & GEM_INTR_BERR) != 0) {
++		printf(", PCI bus error 0x%x",
++		    GEM_READ_4(sc, GEM_PCI_ERROR_STATUS));
++	}
++	printf("\n");
++}
++
++void
++gem_intr(void *v)
++{
++	struct gem_softc *sc = v;
++	uint32_t status, status2;
++
++	GEM_LOCK(sc);
++	status = GEM_READ_4(sc, GEM_STATUS);
++
++#ifdef GEM_DEBUG
++	CTR4(KTR_GEM, "%s: %s: cplt %x, status %x",
++	    device_get_name(sc->sc_dev), __func__,
++	    (status >> GEM_STATUS_TX_COMPLETION_SHFT), (u_int)status);
++
++	/*
++	 * PCS interrupts must be cleared, otherwise no traffic is passed!
++	 */
++	if ((status & GEM_INTR_PCS) != 0) {
++		status2 =
++		    GEM_READ_4(sc, GEM_MII_INTERRUP_STATUS) |
++		    GEM_READ_4(sc, GEM_MII_INTERRUP_STATUS);
++		if ((status2 & GEM_MII_INTERRUP_LINK) != 0)
++			device_printf(sc->sc_dev,
++			    "%s: PCS link status changed\n", __func__);
++	}
++	if ((status & GEM_MAC_CONTROL_STATUS) != 0) {
++		status2 = GEM_READ_4(sc, GEM_MAC_CONTROL_STATUS);
++		if ((status2 & GEM_MAC_PAUSED) != 0)
++			device_printf(sc->sc_dev,
++			    "%s: PAUSE received (PAUSE time %d slots)\n",
++			    __func__, GEM_MAC_PAUSE_TIME(status2));
++		if ((status2 & GEM_MAC_PAUSE) != 0)
++			device_printf(sc->sc_dev,
++			    "%s: transited to PAUSE state\n", __func__);
++		if ((status2 & GEM_MAC_RESUME) != 0)
++			device_printf(sc->sc_dev,
++			    "%s: transited to non-PAUSE state\n", __func__);
++	}
++	if ((status & GEM_INTR_MIF) != 0)
++		device_printf(sc->sc_dev, "%s: MIF interrupt\n", __func__);
++#endif
++
++	if (__predict_false(status &
++	    (GEM_INTR_RX_TAG_ERR | GEM_INTR_PERR | GEM_INTR_BERR)) != 0)
++		gem_eint(sc, status);
++
++	if ((status & (GEM_INTR_RX_DONE | GEM_INTR_RX_NOBUF)) != 0)
++		gem_rint(sc);
++
++	if ((status & (GEM_INTR_TX_EMPTY | GEM_INTR_TX_INTME)) != 0)
++		gem_tint(sc);
++
++	if (__predict_false((status & GEM_INTR_TX_MAC) != 0)) {
++		status2 = GEM_READ_4(sc, GEM_MAC_TX_STATUS);
++		if ((status2 &
++		    ~(GEM_MAC_TX_XMIT_DONE | GEM_MAC_TX_DEFER_EXP |
++		    GEM_MAC_TX_PEAK_EXP)) != 0)
++			device_printf(sc->sc_dev,
++			    "MAC TX fault, status %x\n", status2);
++		if ((status2 &
++		    (GEM_MAC_TX_UNDERRUN | GEM_MAC_TX_PKT_TOO_LONG)) != 0) {
++			if_inc_counter(sc->sc_ifp, IFCOUNTER_OERRORS, 1);
++			if_setdrvflagbits(sc->sc_ifp, 0, IFF_DRV_RUNNING);
++			gem_init_locked(sc);
++		}
++	}
++	if (__predict_false((status & GEM_INTR_RX_MAC) != 0)) {
++		status2 = GEM_READ_4(sc, GEM_MAC_RX_STATUS);
++		/*
++		 * At least with GEM_SUN_GEM revisions GEM_MAC_RX_OVERFLOW
++		 * happen often due to a silicon bug so handle them silently.
++		 * Moreover, it's likely that the receiver has hung so we
++		 * reset it.
++		 */
++		if ((status2 & GEM_MAC_RX_OVERFLOW) != 0) {
++			if_inc_counter(sc->sc_ifp, IFCOUNTER_IERRORS, 1);
++			gem_reset_rxdma(sc);
++		} else if ((status2 &
++		    ~(GEM_MAC_RX_DONE | GEM_MAC_RX_FRAME_CNT)) != 0)
++			device_printf(sc->sc_dev,
++			    "MAC RX fault, status %x\n", status2);
++	}
++	GEM_UNLOCK(sc);
++}
++
++static int
++gem_watchdog(struct gem_softc *sc)
++{
++	if_t ifp = sc->sc_ifp;
++
++	GEM_LOCK_ASSERT(sc, MA_OWNED);
++
++#ifdef GEM_DEBUG
++	CTR4(KTR_GEM,
++	    "%s: GEM_RX_CONFIG %x GEM_MAC_RX_STATUS %x GEM_MAC_RX_CONFIG %x",
++	    __func__, GEM_READ_4(sc, GEM_RX_CONFIG),
++	    GEM_READ_4(sc, GEM_MAC_RX_STATUS),
++	    GEM_READ_4(sc, GEM_MAC_RX_CONFIG));
++	CTR4(KTR_GEM,
++	    "%s: GEM_TX_CONFIG %x GEM_MAC_TX_STATUS %x GEM_MAC_TX_CONFIG %x",
++	    __func__, GEM_READ_4(sc, GEM_TX_CONFIG),
++	    GEM_READ_4(sc, GEM_MAC_TX_STATUS),
++	    GEM_READ_4(sc, GEM_MAC_TX_CONFIG));
++#endif
++
++	if (sc->sc_wdog_timer == 0 || --sc->sc_wdog_timer != 0)
++		return (0);
++
++	if ((sc->sc_flags & GEM_LINK) != 0)
++		device_printf(sc->sc_dev, "device timeout\n");
++	else if (bootverbose)
++		device_printf(sc->sc_dev, "device timeout (no link)\n");
++	if_inc_counter(ifp, IFCOUNTER_OERRORS, 1);
++
++	/* Try to get more packets going. */
++	if_setdrvflagbits(ifp, 0, IFF_DRV_RUNNING);
++	gem_init_locked(sc);
++	gem_start_locked(ifp);
++	return (EJUSTRETURN);
++}
++
++static void
++gem_mifinit(struct gem_softc *sc)
++{
++
++	/* Configure the MIF in frame mode. */
++	GEM_WRITE_4(sc, GEM_MIF_CONFIG,
++	    GEM_READ_4(sc, GEM_MIF_CONFIG) & ~GEM_MIF_CONFIG_BB_ENA);
++	GEM_BARRIER(sc, GEM_MIF_CONFIG, 4,
++	    BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);
++}
++
++/*
++ * MII interface
++ *
++ * The MII interface supports at least three different operating modes:
++ *
++ * Bitbang mode is implemented using data, clock and output enable registers.
++ *
++ * Frame mode is implemented by loading a complete frame into the frame
++ * register and polling the valid bit for completion.
++ *
++ * Polling mode uses the frame register but completion is indicated by
++ * an interrupt.
++ *
++ */
++int
++gem_mii_readreg(device_t dev, int phy, int reg)
++{
++	struct gem_softc *sc;
++	int n;
++	uint32_t v;
++
++#ifdef GEM_DEBUG_PHY
++	printf("%s: phy %d reg %d\n", __func__, phy, reg);
++#endif
++
++	sc = device_get_softc(dev);
++	if ((sc->sc_flags & GEM_SERDES) != 0) {
++		switch (reg) {
++		case MII_BMCR:
++			reg = GEM_MII_CONTROL;
++			break;
++		case MII_BMSR:
++			reg = GEM_MII_STATUS;
++			break;
++		case MII_PHYIDR1:
++		case MII_PHYIDR2:
++			return (0);
++		case MII_ANAR:
++			reg = GEM_MII_ANAR;
++			break;
++		case MII_ANLPAR:
++			reg = GEM_MII_ANLPAR;
++			break;
++		case MII_EXTSR:
++			return (EXTSR_1000XFDX | EXTSR_1000XHDX);
++		default:
++			device_printf(sc->sc_dev,
++			    "%s: unhandled register %d\n", __func__, reg);
++			return (0);
++		}
++		return (GEM_READ_4(sc, reg));
++	}
++
++	/* Construct the frame command. */
++	v = GEM_MIF_FRAME_READ |
++	    (phy << GEM_MIF_PHY_SHIFT) |
++	    (reg << GEM_MIF_REG_SHIFT);
++
++	GEM_WRITE_4(sc, GEM_MIF_FRAME, v);
++	GEM_BARRIER(sc, GEM_MIF_FRAME, 4,
++	    BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);
++	for (n = 0; n < 100; n++) {
++		DELAY(1);
++		v = GEM_READ_4(sc, GEM_MIF_FRAME);
++		if (v & GEM_MIF_FRAME_TA0)
++			return (v & GEM_MIF_FRAME_DATA);
++	}
++
++	device_printf(sc->sc_dev, "%s: timed out\n", __func__);
++	return (0);
++}
++
++int
++gem_mii_writereg(device_t dev, int phy, int reg, int val)
++{
++	struct gem_softc *sc;
++	int n;
++	uint32_t v;
++
++#ifdef GEM_DEBUG_PHY
++	printf("%s: phy %d reg %d val %x\n", phy, reg, val, __func__);
++#endif
++
++	sc = device_get_softc(dev);
++	if ((sc->sc_flags & GEM_SERDES) != 0) {
++		switch (reg) {
++		case MII_BMSR:
++			reg = GEM_MII_STATUS;
++			break;
++		case MII_BMCR:
++			reg = GEM_MII_CONTROL;
++			if ((val & GEM_MII_CONTROL_RESET) == 0)
++				break;
++			GEM_WRITE_4(sc, GEM_MII_CONTROL, val);
++			GEM_BARRIER(sc, GEM_MII_CONTROL, 4,
++			    BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);
++			if (!gem_bitwait(sc, GEM_MII_CONTROL,
++			    GEM_MII_CONTROL_RESET, 0))
++				device_printf(sc->sc_dev,
++				    "cannot reset PCS\n");
++			/* FALLTHROUGH */
++		case MII_ANAR:
++			GEM_WRITE_4(sc, GEM_MII_CONFIG, 0);
++			GEM_BARRIER(sc, GEM_MII_CONFIG, 4,
++			    BUS_SPACE_BARRIER_WRITE);
++			GEM_WRITE_4(sc, GEM_MII_ANAR, val);
++			GEM_BARRIER(sc, GEM_MII_ANAR, 4,
++			    BUS_SPACE_BARRIER_WRITE);
++			GEM_WRITE_4(sc, GEM_MII_SLINK_CONTROL,
++			    GEM_MII_SLINK_LOOPBACK | GEM_MII_SLINK_EN_SYNC_D);
++			GEM_BARRIER(sc, GEM_MII_SLINK_CONTROL, 4,
++			    BUS_SPACE_BARRIER_WRITE);
++			GEM_WRITE_4(sc, GEM_MII_CONFIG,
++			    GEM_MII_CONFIG_ENABLE);
++			GEM_BARRIER(sc, GEM_MII_CONFIG, 4,
++			    BUS_SPACE_BARRIER_WRITE);
++			return (0);
++		case MII_ANLPAR:
++			reg = GEM_MII_ANLPAR;
++			break;
++		default:
++			device_printf(sc->sc_dev,
++			    "%s: unhandled register %d\n", __func__, reg);
++			return (0);
++		}
++		GEM_WRITE_4(sc, reg, val);
++		GEM_BARRIER(sc, reg, 4,
++		    BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);
++		return (0);
++	}
++
++	/* Construct the frame command. */
++	v = GEM_MIF_FRAME_WRITE |
++	    (phy << GEM_MIF_PHY_SHIFT) |
++	    (reg << GEM_MIF_REG_SHIFT) |
++	    (val & GEM_MIF_FRAME_DATA);
++
++	GEM_WRITE_4(sc, GEM_MIF_FRAME, v);
++	GEM_BARRIER(sc, GEM_MIF_FRAME, 4,
++	    BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);
++	for (n = 0; n < 100; n++) {
++		DELAY(1);
++		v = GEM_READ_4(sc, GEM_MIF_FRAME);
++		if (v & GEM_MIF_FRAME_TA0)
++			return (1);
++	}
++
++	device_printf(sc->sc_dev, "%s: timed out\n", __func__);
++	return (0);
++}
++
++void
++gem_mii_statchg(device_t dev)
++{
++	struct gem_softc *sc;
++	int gigabit;
++	uint32_t rxcfg, txcfg, v;
++
++	sc = device_get_softc(dev);
++
++	GEM_LOCK_ASSERT(sc, MA_OWNED);
++
++#ifdef GEM_DEBUG
++	if ((sc->sc_if_getflags(ifp) & IFF_DEBUG) != 0)
++		device_printf(sc->sc_dev, "%s: status change\n", __func__);
++#endif
++
++	if ((sc->sc_mii->mii_media_status & IFM_ACTIVE) != 0 &&
++	    IFM_SUBTYPE(sc->sc_mii->mii_media_active) != IFM_NONE)
++		sc->sc_flags |= GEM_LINK;
++	else
++		sc->sc_flags &= ~GEM_LINK;
++
++	switch (IFM_SUBTYPE(sc->sc_mii->mii_media_active)) {
++	case IFM_1000_SX:
++	case IFM_1000_LX:
++	case IFM_1000_CX:
++	case IFM_1000_T:
++		gigabit = 1;
++		break;
++	default:
++		gigabit = 0;
++	}
++
++	/*
++	 * The configuration done here corresponds to the steps F) and
++	 * G) and as far as enabling of RX and TX MAC goes also step H)
++	 * of the initialization sequence outlined in section 3.2.1 of
++	 * the GEM Gigabit Ethernet ASIC Specification.
++	 */
++
++	rxcfg = sc->sc_mac_rxcfg;
++	rxcfg &= ~GEM_MAC_RX_CARR_EXTEND;
++	txcfg = GEM_MAC_TX_ENA_IPG0 | GEM_MAC_TX_NGU | GEM_MAC_TX_NGU_LIMIT;
++	if ((IFM_OPTIONS(sc->sc_mii->mii_media_active) & IFM_FDX) != 0)
++		txcfg |= GEM_MAC_TX_IGN_CARRIER | GEM_MAC_TX_IGN_COLLIS;
++	else if (gigabit != 0) {
++		rxcfg |= GEM_MAC_RX_CARR_EXTEND;
++		txcfg |= GEM_MAC_TX_CARR_EXTEND;
++	}
++	(void)gem_disable_tx(sc);
++	GEM_WRITE_4(sc, GEM_MAC_TX_CONFIG, txcfg);
++	(void)gem_disable_rx(sc);
++	GEM_WRITE_4(sc, GEM_MAC_RX_CONFIG, rxcfg);
++
++	v = GEM_READ_4(sc, GEM_MAC_CONTROL_CONFIG) &
++	    ~(GEM_MAC_CC_RX_PAUSE | GEM_MAC_CC_TX_PAUSE);
++	if ((IFM_OPTIONS(sc->sc_mii->mii_media_active) &
++	    IFM_ETH_RXPAUSE) != 0)
++		v |= GEM_MAC_CC_RX_PAUSE;
++	if ((IFM_OPTIONS(sc->sc_mii->mii_media_active) &
++	    IFM_ETH_TXPAUSE) != 0)
++		v |= GEM_MAC_CC_TX_PAUSE;
++	GEM_WRITE_4(sc, GEM_MAC_CONTROL_CONFIG, v);
++
++	if ((IFM_OPTIONS(sc->sc_mii->mii_media_active) & IFM_FDX) == 0 &&
++	    gigabit != 0)
++		GEM_WRITE_4(sc, GEM_MAC_SLOT_TIME,
++		    GEM_MAC_SLOT_TIME_CARR_EXTEND);
++	else
++		GEM_WRITE_4(sc, GEM_MAC_SLOT_TIME,
++		    GEM_MAC_SLOT_TIME_NORMAL);
++
++	/* XIF Configuration */
++	v = GEM_MAC_XIF_LINK_LED;
++	v |= GEM_MAC_XIF_TX_MII_ENA;
++	if ((sc->sc_flags & GEM_SERDES) == 0) {
++		if ((GEM_READ_4(sc, GEM_MIF_CONFIG) &
++		    GEM_MIF_CONFIG_PHY_SEL) != 0) {
++			/* External MII needs echo disable if half duplex. */
++			if ((IFM_OPTIONS(sc->sc_mii->mii_media_active) &
++			    IFM_FDX) == 0)
++				v |= GEM_MAC_XIF_ECHO_DISABL;
++		} else
++			/*
++			 * Internal MII needs buffer enable.
++			 * XXX buffer enable makes only sense for an
++			 * external PHY.
++			 */
++			v |= GEM_MAC_XIF_MII_BUF_ENA;
++	}
++	if (gigabit != 0)
++		v |= GEM_MAC_XIF_GMII_MODE;
++	if ((IFM_OPTIONS(sc->sc_mii->mii_media_active) & IFM_FDX) != 0)
++		v |= GEM_MAC_XIF_FDPLX_LED;
++	GEM_WRITE_4(sc, GEM_MAC_XIF_CONFIG, v);
++
++	sc->sc_mac_rxcfg = rxcfg;
++	if ((if_getdrvflags(sc->sc_ifp) & IFF_DRV_RUNNING) != 0 &&
++	    (sc->sc_flags & GEM_LINK) != 0) {
++		GEM_WRITE_4(sc, GEM_MAC_TX_CONFIG,
++		    txcfg | GEM_MAC_TX_ENABLE);
++		GEM_WRITE_4(sc, GEM_MAC_RX_CONFIG,
++		    rxcfg | GEM_MAC_RX_ENABLE);
++	}
++}
++
++int
++gem_mediachange(if_t ifp)
++{
++	struct gem_softc *sc = if_getsoftc(ifp);
++	int error;
++
++	/* XXX add support for serial media. */
++
++	GEM_LOCK(sc);
++	error = mii_mediachg(sc->sc_mii);
++	GEM_UNLOCK(sc);
++	return (error);
++}
++
++void
++gem_mediastatus(if_t ifp, struct ifmediareq *ifmr)
++{
++	struct gem_softc *sc = if_getsoftc(ifp);
++
++	GEM_LOCK(sc);
++	if ((if_getflags(ifp) & IFF_UP) == 0) {
++		GEM_UNLOCK(sc);
++		return;
++	}
++
++	mii_pollstat(sc->sc_mii);
++	ifmr->ifm_active = sc->sc_mii->mii_media_active;
++	ifmr->ifm_status = sc->sc_mii->mii_media_status;
++	GEM_UNLOCK(sc);
++}
++
++static int
++gem_ioctl(if_t ifp, u_long cmd, caddr_t data)
++{
++	struct gem_softc *sc = if_getsoftc(ifp);
++	struct ifreq *ifr = (struct ifreq *)data;
++	int error;
++
++	error = 0;
++	switch (cmd) {
++	case SIOCSIFFLAGS:
++		GEM_LOCK(sc);
++		if ((if_getflags(ifp) & IFF_UP) != 0) {
++			if ((if_getdrvflags(ifp) & IFF_DRV_RUNNING) != 0 &&
++			    ((if_getflags(ifp) ^ sc->sc_ifflags) &
++			    (IFF_ALLMULTI | IFF_PROMISC)) != 0)
++				gem_setladrf(sc);
++			else
++				gem_init_locked(sc);
++		} else if ((if_getdrvflags(ifp) & IFF_DRV_RUNNING) != 0)
++			gem_stop(ifp, 0);
++		if ((if_getflags(ifp) & IFF_LINK0) != 0)
++			sc->sc_csum_features |= CSUM_UDP;
++		else
++			sc->sc_csum_features &= ~CSUM_UDP;
++		if ((if_getcapenable(ifp) & IFCAP_TXCSUM) != 0)
++			if_sethwassist(ifp, sc->sc_csum_features);
++		sc->sc_ifflags = if_getflags(ifp);
++		GEM_UNLOCK(sc);
++		break;
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		GEM_LOCK(sc);
++		if ((if_getdrvflags(ifp) & IFF_DRV_RUNNING) != 0)
++			gem_setladrf(sc);
++		GEM_UNLOCK(sc);
++		break;
++	case SIOCGIFMEDIA:
++	case SIOCSIFMEDIA:
++		error = ifmedia_ioctl(ifp, ifr, &sc->sc_mii->mii_media, cmd);
++		break;
++	case SIOCSIFCAP:
++		GEM_LOCK(sc);
++		if_setcapenable(ifp, ifr->ifr_reqcap);
++		if ((if_getcapenable(ifp) & IFCAP_TXCSUM) != 0)
++			if_sethwassist(ifp, sc->sc_csum_features);
++		else
++			if_sethwassist(ifp, 0);
++		GEM_UNLOCK(sc);
++		break;
++	default:
++		error = ether_ioctl(ifp, cmd, data);
++		break;
++	}
++
++	return (error);
++}
++
++static u_int
++gem_hash_maddr(void *arg, struct sockaddr_dl *sdl, u_int cnt)
++{
++	uint32_t crc, *hash = arg;
++
++	crc = ether_crc32_le(LLADDR(sdl), ETHER_ADDR_LEN);
++	/* We just want the 8 most significant bits. */
++	crc >>= 24;
++	/* Set the corresponding bit in the filter. */
++	hash[crc >> 4] |= 1 << (15 - (crc & 15));
++
++	return (1);
++}
++
++static void
++gem_setladrf(struct gem_softc *sc)
++{
++	if_t ifp = sc->sc_ifp;
++	int i;
++	uint32_t hash[16];
++	uint32_t v;
++
++	GEM_LOCK_ASSERT(sc, MA_OWNED);
++
++	/*
++	 * Turn off the RX MAC and the hash filter as required by the Sun GEM
++	 * programming restrictions.
++	 */
++	v = sc->sc_mac_rxcfg & ~GEM_MAC_RX_HASH_FILTER;
++	GEM_WRITE_4(sc, GEM_MAC_RX_CONFIG, v);
++	GEM_BARRIER(sc, GEM_MAC_RX_CONFIG, 4,
++	    BUS_SPACE_BARRIER_READ | BUS_SPACE_BARRIER_WRITE);
++	if (!gem_bitwait(sc, GEM_MAC_RX_CONFIG, GEM_MAC_RX_HASH_FILTER |
++	    GEM_MAC_RX_ENABLE, 0))
++		device_printf(sc->sc_dev,
++		    "cannot disable RX MAC or hash filter\n");
++
++	v &= ~(GEM_MAC_RX_PROMISCUOUS | GEM_MAC_RX_PROMISC_GRP);
++	if ((if_getflags(ifp) & IFF_PROMISC) != 0) {
++		v |= GEM_MAC_RX_PROMISCUOUS;
++		goto chipit;
++	}
++	if ((if_getflags(ifp) & IFF_ALLMULTI) != 0) {
++		v |= GEM_MAC_RX_PROMISC_GRP;
++		goto chipit;
++	}
++
++	/*
++	 * Set up multicast address filter by passing all multicast
++	 * addresses through a crc generator, and then using the high
++	 * order 8 bits as an index into the 256 bit logical address
++	 * filter.  The high order 4 bits selects the word, while the
++	 * other 4 bits select the bit within the word (where bit 0
++	 * is the MSB).
++	 */
++
++	memset(hash, 0, sizeof(hash));
++	if_foreach_llmaddr(ifp, gem_hash_maddr, hash);
++
++	v |= GEM_MAC_RX_HASH_FILTER;
++
++	/* Now load the hash table into the chip (if we are using it). */
++	for (i = 0; i < 16; i++)
++		GEM_WRITE_4(sc,
++		    GEM_MAC_HASH0 + i * (GEM_MAC_HASH1 - GEM_MAC_HASH0),
++		    hash[i]);
++
++ chipit:
++	sc->sc_mac_rxcfg = v;
++	GEM_WRITE_4(sc, GEM_MAC_RX_CONFIG, v | GEM_MAC_RX_ENABLE);
++}
+diff --git a/freebsd/sys/dev/gem/if_gem_pci.c b/freebsd/sys/dev/gem/if_gem_pci.c
+new file mode 100644
+index 00000000..540ed1d2
+--- /dev/null
++++ b/freebsd/sys/dev/gem/if_gem_pci.c
+@@ -0,0 +1,348 @@
++#include <machine/rtems-bsd-kernel-space.h>
++
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (C) 2001 Eduardo Horvath.
++ * Copyright (c) 2007 Marius Strobl <marius@FreeBSD.org>
++ * All rights reserved.
++ *
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR  ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR  BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ *
++ *	from: NetBSD: if_gem_pci.c,v 1.7 2001/10/18 15:09:15 thorpej Exp
++ */
++
++#include <sys/cdefs.h>
++/*
++ * PCI bindings for Apple GMAC and Sun GEM Ethernet controllers
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/bus.h>
++#include <sys/kernel.h>
++#include <sys/lock.h>
++#include <sys/module.h>
++#include <sys/mutex.h>
++#include <sys/resource.h>
++#include <sys/rman.h>
++#include <sys/socket.h>
++
++#include <net/ethernet.h>
++#include <net/if.h>
++
++#include <machine/bus.h>
++#if defined(__powerpc__)
++#ifndef __rtems__
++#include <dev/ofw/ofw_bus.h>
++#include <dev/ofw/openfirm.h>
++#include <machine/ofw_machdep.h>
++#endif
++#endif
++#include <machine/resource.h>
++
++#include <dev/gem/if_gemreg.h>
++#include <dev/gem/if_gemvar.h>
++
++#include <dev/pci/pcireg.h>
++#include <dev/pci/pcivar.h>
++
++#ifdef __rtems__
++#include <rtems/bsd/local/miibus_if.h>
++#include <rtems/bsd/bsd.h>
++#else
++#include "miibus_if.h"
++#endif /* __rtems__ */
++
++static int	gem_pci_attach(device_t dev);
++static int	gem_pci_detach(device_t dev);
++static int	gem_pci_probe(device_t dev);
++static int	gem_pci_resume(device_t dev);
++static int	gem_pci_suspend(device_t dev);
++
++static const struct gem_pci_dev {
++	uint32_t	gpd_devid;
++	int		gpd_variant;
++	const char	*gpd_desc;
++} gem_pci_devlist[] = {
++	{ 0x2bad108e, GEM_SUN_GEM,	"Sun GEM Gigabit Ethernet" },
++	{ 0x0021106b, GEM_APPLE_GMAC,	"Apple UniNorth GMAC Ethernet" },
++	{ 0x0024106b, GEM_APPLE_GMAC,	"Apple Pangea GMAC Ethernet" },
++	{ 0x0032106b, GEM_APPLE_GMAC,	"Apple UniNorth2 GMAC Ethernet" },
++	{ 0x004c106b, GEM_APPLE_K2_GMAC,"Apple K2 GMAC Ethernet" },
++	{ 0x0051106b, GEM_APPLE_GMAC,	"Apple Shasta GMAC Ethernet" },
++	{ 0x006b106b, GEM_APPLE_GMAC,	"Apple Intrepid 2 GMAC Ethernet" },
++	{ 0, 0, NULL }
++};
++
++static device_method_t gem_pci_methods[] = {
++	/* Device interface */
++	DEVMETHOD(device_probe,		gem_pci_probe),
++	DEVMETHOD(device_attach,	gem_pci_attach),
++	DEVMETHOD(device_detach,	gem_pci_detach),
++	DEVMETHOD(device_suspend,	gem_pci_suspend),
++	DEVMETHOD(device_resume,	gem_pci_resume),
++	/* Use the suspend handler here, it is all that is required. */
++	DEVMETHOD(device_shutdown,	gem_pci_suspend),
++
++	/* MII interface */
++	DEVMETHOD(miibus_readreg,	gem_mii_readreg),
++	DEVMETHOD(miibus_writereg,	gem_mii_writereg),
++	DEVMETHOD(miibus_statchg,	gem_mii_statchg),
++
++	DEVMETHOD_END
++};
++
++static driver_t gem_pci_driver = {
++	"gem",
++	gem_pci_methods,
++	sizeof(struct gem_softc)
++};
++
++DRIVER_MODULE(gem, pci, gem_pci_driver, 0, 0);
++MODULE_PNP_INFO("W32:vendor/device", pci, gem, gem_pci_devlist,
++    nitems(gem_pci_devlist) - 1);
++MODULE_DEPEND(gem, pci, 1, 1, 1);
++MODULE_DEPEND(gem, ether, 1, 1, 1);
++
++static int
++gem_pci_probe(device_t dev)
++{
++	int i;
++
++	for (i = 0; gem_pci_devlist[i].gpd_desc != NULL; i++) {
++		if (pci_get_devid(dev) == gem_pci_devlist[i].gpd_devid) {
++			device_set_desc(dev, gem_pci_devlist[i].gpd_desc);
++			return (BUS_PROBE_DEFAULT);
++		}
++	}
++
++	return (ENXIO);
++}
++
++static struct resource_spec gem_pci_res_spec[] = {
++	{ SYS_RES_IRQ, 0, RF_SHAREABLE | RF_ACTIVE },	/* GEM_RES_INTR */
++	{ SYS_RES_MEMORY, PCIR_BAR(0), RF_ACTIVE },	/* GEM_RES_MEM */
++	{ -1, 0 }
++};
++
++#define	GEM_SHARED_PINS		"shared-pins"
++#define	GEM_SHARED_PINS_SERDES	"serdes"
++
++static int
++gem_pci_attach(device_t dev)
++{
++	struct gem_softc *sc;
++	int i;
++#if defined(__powerpc__) && !defined(__rtems__)
++	char buf[sizeof(GEM_SHARED_PINS)];
++#else
++	int j;
++#endif
++
++	sc = device_get_softc(dev);
++	sc->sc_variant = GEM_UNKNOWN;
++	for (i = 0; gem_pci_devlist[i].gpd_desc != NULL; i++) {
++		if (pci_get_devid(dev) == gem_pci_devlist[i].gpd_devid) {
++			sc->sc_variant = gem_pci_devlist[i].gpd_variant;
++			break;
++		}
++	}
++	if (sc->sc_variant == GEM_UNKNOWN) {
++		device_printf(dev, "unknown adaptor\n");
++		return (ENXIO);
++	}
++
++	pci_enable_busmaster(dev);
++
++	sc->sc_dev = dev;
++
++	if (bus_alloc_resources(dev, gem_pci_res_spec, sc->sc_res)) {
++		device_printf(dev, "failed to allocate resources\n");
++		bus_release_resources(dev, gem_pci_res_spec, sc->sc_res);
++		return (ENXIO);
++	}
++
++	GEM_LOCK_INIT(sc, device_get_nameunit(dev));
++
++	/* Determine whether we're running at 66MHz. */
++	if ((GEM_READ_4(sc, GEM_PCI_BIF_CONFIG) & GEM_PCI_BIF_CNF_M66EN) != 0)
++		sc->sc_flags |= GEM_PCI66;
++
++#if defined(__powerpc__) && defined(__rtems__)
++	rtems_bsd_get_mac_address(device_get_name(dev),
++	    device_get_unit(dev), sc->sc_enaddr);
++#elif defined(__powerpc__)
++	OF_getetheraddr(dev, sc->sc_enaddr);
++	if (OF_getprop(ofw_bus_get_node(dev), GEM_SHARED_PINS, buf,
++	    sizeof(buf)) > 0) {
++		buf[sizeof(buf) - 1] = '\0';
++		if (strcmp(buf, GEM_SHARED_PINS_SERDES) == 0)
++			sc->sc_flags |= GEM_SERDES;
++	}
++#else
++	/*
++	 * Dig out VPD (vital product data) and read NA (network address).
++	 * The VPD resides in the PCI Expansion ROM (PCI FCode) and can't
++	 * be accessed via the PCI capability pointer.
++	 * ``Writing FCode 3.x Programs'' (newer ones, dated 1997 and later)
++	 * chapter 2 describes the data structure.
++	 */
++
++#define	PCI_ROMHDR_SIZE			0x1c
++#define	PCI_ROMHDR_SIG			0x00
++#define	PCI_ROMHDR_SIG_MAGIC		0xaa55		/* little endian */
++#define	PCI_ROMHDR_PTR_DATA		0x18
++#define	PCI_ROM_SIZE			0x18
++#define	PCI_ROM_SIG			0x00
++#define	PCI_ROM_SIG_MAGIC		0x52494350	/* "PCIR", endian */
++							/* reversed */
++#define	PCI_ROM_VENDOR			0x04
++#define	PCI_ROM_DEVICE			0x06
++#define	PCI_ROM_PTR_VPD			0x08
++#define	PCI_VPDRES_BYTE0		0x00
++#define	PCI_VPDRES_ISLARGE(x)		((x) & 0x80)
++#define	PCI_VPDRES_LARGE_NAME(x)	((x) & 0x7f)
++#define	PCI_VPDRES_LARGE_LEN_LSB	0x01
++#define	PCI_VPDRES_LARGE_LEN_MSB	0x02
++#define	PCI_VPDRES_LARGE_SIZE		0x03
++#define	PCI_VPDRES_TYPE_VPD		0x10		/* large */
++#define	PCI_VPD_KEY0			0x00
++#define	PCI_VPD_KEY1			0x01
++#define	PCI_VPD_LEN			0x02
++#define	PCI_VPD_SIZE			0x03
++
++#define	GEM_ROM_READ_1(sc, offs)					\
++	GEM_READ_1((sc), GEM_PCI_ROM_OFFSET + (offs))
++#define	GEM_ROM_READ_2(sc, offs)					\
++	GEM_READ_2((sc), GEM_PCI_ROM_OFFSET + (offs))
++#define	GEM_ROM_READ_4(sc, offs)					\
++	GEM_READ_4((sc), GEM_PCI_ROM_OFFSET + (offs))
++
++	/* Read PCI Expansion ROM header. */
++	if (GEM_ROM_READ_2(sc, PCI_ROMHDR_SIG) != PCI_ROMHDR_SIG_MAGIC ||
++	    (i = GEM_ROM_READ_2(sc, PCI_ROMHDR_PTR_DATA)) <
++	    PCI_ROMHDR_SIZE) {
++		device_printf(dev, "unexpected PCI Expansion ROM header\n");
++		goto fail;
++	}
++
++	/* Read PCI Expansion ROM data. */
++	if (GEM_ROM_READ_4(sc, i + PCI_ROM_SIG) != PCI_ROM_SIG_MAGIC ||
++	    GEM_ROM_READ_2(sc, i + PCI_ROM_VENDOR) != pci_get_vendor(dev) ||
++	    GEM_ROM_READ_2(sc, i + PCI_ROM_DEVICE) != pci_get_device(dev) ||
++	    (j = GEM_ROM_READ_2(sc, i + PCI_ROM_PTR_VPD)) <
++	    i + PCI_ROM_SIZE) {
++		device_printf(dev, "unexpected PCI Expansion ROM data\n");
++		goto fail;
++	}
++
++	/*
++	 * Read PCI VPD.
++	 * SUNW,pci-gem cards have a single large resource VPD-R tag
++	 * containing one NA.  The VPD used is not in PCI 2.2 standard
++	 * format however.  The length in the resource header is in big
++	 * endian and the end tag is non-standard (0x79) and followed
++	 * by an all-zero "checksum" byte.  Sun calls this a "Fresh
++	 * Choice Ethernet" VPD...
++	 */
++	if (PCI_VPDRES_ISLARGE(GEM_ROM_READ_1(sc,
++	    j + PCI_VPDRES_BYTE0)) == 0 ||
++	    PCI_VPDRES_LARGE_NAME(GEM_ROM_READ_1(sc,
++	    j + PCI_VPDRES_BYTE0)) != PCI_VPDRES_TYPE_VPD ||
++	    ((GEM_ROM_READ_1(sc, j + PCI_VPDRES_LARGE_LEN_LSB) << 8) |
++	    GEM_ROM_READ_1(sc, j + PCI_VPDRES_LARGE_LEN_MSB)) !=
++	    PCI_VPD_SIZE + ETHER_ADDR_LEN ||
++	    GEM_ROM_READ_1(sc, j + PCI_VPDRES_LARGE_SIZE + PCI_VPD_KEY0) !=
++	    0x4e /* N */ ||
++	    GEM_ROM_READ_1(sc, j + PCI_VPDRES_LARGE_SIZE + PCI_VPD_KEY1) !=
++	    0x41 /* A */ ||
++	    GEM_ROM_READ_1(sc, j + PCI_VPDRES_LARGE_SIZE + PCI_VPD_LEN) !=
++	    ETHER_ADDR_LEN ||
++	    GEM_ROM_READ_1(sc, j + PCI_VPDRES_LARGE_SIZE + PCI_VPD_SIZE +
++	    ETHER_ADDR_LEN) != 0x79) {
++		device_printf(dev, "unexpected PCI VPD\n");
++		goto fail;
++	}
++	bus_read_region_1(sc->sc_res[GEM_RES_MEM],
++	    GEM_PCI_ROM_OFFSET + j + PCI_VPDRES_LARGE_SIZE + PCI_VPD_SIZE,
++	    sc->sc_enaddr, ETHER_ADDR_LEN);
++#endif
++	/*
++	 * The Xserve G5 has a fake GMAC with an all-zero MAC address.
++	 * Check for this, and don't attach in this case.
++	 */
++
++	for (i = 0; i < ETHER_ADDR_LEN && sc->sc_enaddr[i] == 0; i++) {}
++	if (i == ETHER_ADDR_LEN) {
++		device_printf(dev, "invalid MAC address\n");
++		goto fail;
++	}
++
++	if (gem_attach(sc) != 0) {
++		device_printf(dev, "could not be attached\n");
++		goto fail;
++	}
++
++	if (bus_setup_intr(dev, sc->sc_res[GEM_RES_INTR], INTR_TYPE_NET |
++	    INTR_MPSAFE, NULL, gem_intr, sc, &sc->sc_ih) != 0) {
++		device_printf(dev, "failed to set up interrupt\n");
++		gem_detach(sc);
++		goto fail;
++	}
++	return (0);
++
++ fail:
++	GEM_LOCK_DESTROY(sc);
++	bus_release_resources(dev, gem_pci_res_spec, sc->sc_res);
++	return (ENXIO);
++}
++
++static int
++gem_pci_detach(device_t dev)
++{
++	struct gem_softc *sc;
++
++	sc = device_get_softc(dev);
++	bus_teardown_intr(dev, sc->sc_res[GEM_RES_INTR], sc->sc_ih);
++	gem_detach(sc);
++	GEM_LOCK_DESTROY(sc);
++	bus_release_resources(dev, gem_pci_res_spec, sc->sc_res);
++	return (0);
++}
++
++static int
++gem_pci_suspend(device_t dev)
++{
++
++	gem_suspend(device_get_softc(dev));
++	return (0);
++}
++
++static int
++gem_pci_resume(device_t dev)
++{
++
++	gem_resume(device_get_softc(dev));
++	return (0);
++}
+diff --git a/freebsd/sys/dev/gem/if_gemreg.h b/freebsd/sys/dev/gem/if_gemreg.h
+new file mode 100644
+index 00000000..86611c17
+--- /dev/null
++++ b/freebsd/sys/dev/gem/if_gemreg.h
+@@ -0,0 +1,591 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (C) 2001 Eduardo Horvath.
++ * All rights reserved.
++ *
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR  ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR  BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ *
++ *	from: NetBSD: gemreg.h,v 1.9 2006/11/24 13:01:07 martin Exp
++ */
++
++#ifndef	_IF_GEMREG_H
++#define	_IF_GEMREG_H
++
++/* register definitions for Apple GMAC and Sun GEM */
++
++#define	GEM_SEB_STATE		0x0000	/* SEB state reg, R/O */
++#define	GEM_CONFIG		0x0004	/* config reg */
++#define	GEM_STATUS		0x000c	/* status reg */
++/* Note: Reading the status reg clears bits 0-6. */
++#define	GEM_INTMASK		0x0010
++#define	GEM_INTACK		0x0014	/* Interrupt acknowledge, W/O */
++#define	GEM_STATUS_ALIAS	0x001c
++
++/* Bits in GEM_SEB register */
++#define	GEM_SEB_ARB		0x00000002	/* Arbitration status */
++#define	GEM_SEB_RXWON		0x00000004
++
++/* Bits in GEM_CONFIG register */
++#define	GEM_CONFIG_BURST_64	0x00000000	/* maximum burst size 64KB */
++#define	GEM_CONFIG_BURST_INF	0x00000001	/* infinite for entire packet */
++#define	GEM_CONFIG_TXDMA_LIMIT	0x0000003e
++#define	GEM_CONFIG_RXDMA_LIMIT	0x000007c0
++/* GEM_CONFIG_RONPAULBIT and GEM_CONFIG_BUG2FIX are Apple only. */
++#define	GEM_CONFIG_RONPAULBIT	0x00000800	/* after infinite burst use */
++						/* memory read multiple for */
++						/* PCI commands */
++#define	GEM_CONFIG_BUG2FIX	0x00001000	/* fix RX hang after overflow */
++
++#define	GEM_CONFIG_TXDMA_LIMIT_SHIFT	1
++#define	GEM_CONFIG_RXDMA_LIMIT_SHIFT	6
++
++/* Top part of GEM_STATUS has TX completion information */
++#define	GEM_STATUS_TX_COMPLETION_MASK	0xfff80000	/* TX completion reg. */
++#define	GEM_STATUS_TX_COMPLETION_SHFT	19
++
++/*
++ * Interrupt bits, for both the GEM_STATUS and GEM_INTMASK regs
++ * Bits 0-6 auto-clear when read.
++ */
++#define	GEM_INTR_TX_INTME	0x00000001	/* Frame w/INTME bit set sent */
++#define	GEM_INTR_TX_EMPTY	0x00000002	/* TX ring empty */
++#define	GEM_INTR_TX_DONE	0x00000004	/* TX complete */
++#define	GEM_INTR_RX_DONE	0x00000010	/* Got a packet */
++#define	GEM_INTR_RX_NOBUF	0x00000020
++#define	GEM_INTR_RX_TAG_ERR	0x00000040
++#define	GEM_INTR_PERR		0x00000080	/* Parity error */
++#define	GEM_INTR_PCS		0x00002000	/* Physical Code Sub-layer */
++#define	GEM_INTR_TX_MAC		0x00004000
++#define	GEM_INTR_RX_MAC		0x00008000
++#define	GEM_INTR_MAC_CONTROL	0x00010000	/* MAC control interrupt */
++#define	GEM_INTR_MIF		0x00020000
++#define	GEM_INTR_BERR		0x00040000	/* Bus error interrupt */
++#define	GEM_INTR_BITS	"\177\020"					\
++			"b\0INTME\0b\1TXEMPTY\0b\2TXDONE\0"		\
++			"b\4RXDONE\0b\5RXNOBUF\0b\6RX_TAG_ERR\0"	\
++			"b\xdPCS\0b\xeTXMAC\0b\xfRXMAC\0"		\
++			"b\x10MAC_CONTROL\0b\x11MIF\0b\x12IBERR\0\0"
++
++/* This is the same as the GEM_STATUS reg but reading it does not clear bits. */
++#define	GEM_PCI_ERROR_STATUS	0x1000	/* PCI error status */
++#define	GEM_PCI_ERROR_MASK	0x1004	/* PCI error mask */
++#define	GEM_PCI_BIF_CONFIG	0x1008	/* PCI BIF configuration */
++#define	GEM_PCI_BIF_DIAG	0x100c	/* PCI BIF diagnostic */
++
++#define	GEM_RESET		0x0010	/* software reset */
++
++/* GEM_PCI_ERROR_STATUS and GEM_PCI_ERROR_MASK error bits */
++#define	GEM_PCI_ERR_STAT_BADACK	0x00000001	/* No ACK64# */
++#define	GEM_PCI_ERR_STAT_DTRTO	0x00000002	/* Delayed xaction timeout */
++#define	GEM_PCI_ERR_STAT_OTHERS	0x00000004
++#define	GEM_PCI_ERR_BITS	"\177\020b\0ACKBAD\0b\1DTRTO\0b\2OTHER\0\0"
++
++/* GEM_PCI_BIF_CONFIG register bits */
++#define	GEM_PCI_BIF_CNF_SLOWCLK	0x00000001	/* Parity error timing */
++#define	GEM_PCI_BIF_CNF_HOST_64	0x00000002	/* 64-bit host */
++#define	GEM_PCI_BIF_CNF_B64D_DS	0x00000004	/* no 64-bit data cycle */
++#define	GEM_PCI_BIF_CNF_M66EN	0x00000008
++#define	GEM_PCI_BIF_CNF_BITS	"\177\020b\0SLOWCLK\0b\1HOST64\0"	\
++				"b\2B64DIS\0b\3M66EN\0\0"
++
++/* GEM_PCI_BIF_DIAG register bits */
++#define	GEN_PCI_BIF_DIAG_BC_SM	0x007f0000	/* burst ctrl. state machine */
++#define	GEN_PCI_BIF_DIAG_SM	0xff000000	/* BIF state machine */
++
++/* GEM_RESET register bits -- TX and RX self clear when complete. */
++#define	GEM_RESET_TX		0x00000001	/* Reset TX half. */
++#define	GEM_RESET_RX		0x00000002	/* Reset RX half. */
++#define	GEM_RESET_PCI_RSTOUT	0x00000004	/* Force PCI RSTOUT#. */
++
++/* TX DMA registers */
++#define	GEM_TX_KICK		0x2000		/* Write last valid desc + 1 */
++#define	GEM_TX_CONFIG		0x2004
++#define	GEM_TX_RING_PTR_LO	0x2008
++#define	GEM_TX_RING_PTR_HI	0x200c
++
++#define	GEM_TX_FIFO_WR_PTR	0x2014		/* FIFO write pointer */
++#define	GEM_TX_FIFO_SDWR_PTR	0x2018		/* FIFO shadow write pointer */
++#define	GEM_TX_FIFO_RD_PTR	0x201c		/* FIFO read pointer */
++#define	GEM_TX_FIFO_SDRD_PTR	0x2020		/* FIFO shadow read pointer */
++#define	GEM_TX_FIFO_PKT_CNT	0x2024		/* FIFO packet counter */
++
++#define	GEM_TX_STATE_MACHINE	0x2028		/* ETX state machine reg */
++#define	GEM_TX_DATA_PTR_LO	0x2030
++#define	GEM_TX_DATA_PTR_HI	0x2034
++
++#define	GEM_TX_COMPLETION	0x2100
++#define	GEM_TX_FIFO_ADDRESS	0x2104
++#define	GEM_TX_FIFO_TAG		0x2108
++#define	GEM_TX_FIFO_DATA_LO	0x210c
++#define	GEM_TX_FIFO_DATA_HI_T1	0x2110
++#define	GEM_TX_FIFO_DATA_HI_T0	0x2114
++#define	GEM_TX_FIFO_SIZE	0x2118
++#define	GEM_TX_DEBUG		0x3028
++
++/* GEM_TX_CONFIG register bits */
++#define	GEM_TX_CONFIG_TXDMA_EN	0x00000001	/* TX DMA enable */
++#define	GEM_TX_CONFIG_TXRING_SZ	0x0000001e	/* TX ring size */
++#define	GEM_TX_CONFIG_TXFIFO_TH	0x001ffc00	/* TX fifo threshold */
++#define	GEM_TX_CONFIG_PACED	0x00200000	/* TX_all_int modifier */
++
++#define	GEM_RING_SZ_32		(0<<1)	/* 32 descriptors */
++#define	GEM_RING_SZ_64		(1<<1)
++#define	GEM_RING_SZ_128		(2<<1)
++#define	GEM_RING_SZ_256		(3<<1)
++#define	GEM_RING_SZ_512		(4<<1)
++#define	GEM_RING_SZ_1024	(5<<1)
++#define	GEM_RING_SZ_2048	(6<<1)
++#define	GEM_RING_SZ_4096	(7<<1)
++#define	GEM_RING_SZ_8192	(8<<1)
++
++/* GEM_TX_COMPLETION register bits */
++#define	GEM_TX_COMPLETION_MASK	0x00001fff	/* # of last descriptor */
++
++/* RX DMA registers */
++#define	GEM_RX_CONFIG		0x4000
++#define	GEM_RX_RING_PTR_LO	0x4004		/* 64-bits unaligned GAK! */
++#define	GEM_RX_RING_PTR_HI	0x4008		/* 64-bits unaligned GAK! */
++
++#define	GEM_RX_FIFO_WR_PTR	0x400c		/* FIFO write pointer */
++#define	GEM_RX_FIFO_SDWR_PTR	0x4010		/* FIFO shadow write pointer */
++#define	GEM_RX_FIFO_RD_PTR	0x4014		/* FIFO read pointer */
++#define	GEM_RX_FIFO_PKT_CNT	0x4018		/* FIFO packet counter */
++
++#define	GEM_RX_STATE_MACHINE	0x401c		/* ERX state machine reg */
++#define	GEM_RX_PAUSE_THRESH	0x4020
++
++#define	GEM_RX_DATA_PTR_LO	0x4024		/* ERX state machine reg */
++#define	GEM_RX_DATA_PTR_HI	0x4028		/* Damn thing is unaligned */
++
++#define	GEM_RX_KICK		0x4100		/* Write last valid desc + 1 */
++#define	GEM_RX_COMPLETION	0x4104		/* First pending desc */
++#define	GEM_RX_BLANKING		0x4108		/* Interrupt blanking reg */
++
++#define	GEM_RX_FIFO_ADDRESS	0x410c
++#define	GEM_RX_FIFO_TAG		0x4110
++#define	GEM_RX_FIFO_DATA_LO	0x4114
++#define	GEM_RX_FIFO_DATA_HI_T1	0x4118
++#define	GEM_RX_FIFO_DATA_HI_T0	0x411c
++#define	GEM_RX_FIFO_SIZE	0x4120
++
++/* GEM_RX_CONFIG register bits */
++#define	GEM_RX_CONFIG_RXDMA_EN	0x00000001	/* RX DMA enable */
++#define	GEM_RX_CONFIG_RXRING_SZ	0x0000001e	/* RX ring size */
++#define	GEM_RX_CONFIG_BATCH_DIS	0x00000020	/* desc batching disable */
++#define	GEM_RX_CONFIG_FBOFF	0x00001c00	/* first byte offset */
++#define	GEM_RX_CONFIG_CXM_START	0x000fe000	/* cksum start offset bytes */
++#define	GEM_RX_CONFIG_FIFO_THRS	0x07000000	/* fifo threshold size */
++
++#define	GEM_THRSH_64	0
++#define	GEM_THRSH_128	1
++#define	GEM_THRSH_256	2
++#define	GEM_THRSH_512	3
++#define	GEM_THRSH_1024	4
++#define	GEM_THRSH_2048	5
++
++#define	GEM_RX_CONFIG_FIFO_THRS_SHIFT	24
++#define	GEM_RX_CONFIG_FBOFF_SHFT	10
++#define	GEM_RX_CONFIG_CXM_START_SHFT	13
++
++/* GEM_RX_PAUSE_THRESH register bits -- sizes in multiples of 64 bytes */
++#define	GEM_RX_PTH_XOFF_THRESH	0x000001ff
++#define	GEM_RX_PTH_XON_THRESH	0x001ff000
++
++/* GEM_RX_BLANKING register bits */
++#define	GEM_RX_BLANKING_PACKETS	0x000001ff	/* Delay intr for x packets */
++#define	GEM_RX_BLANKING_TIME	0x000ff000	/* Delay intr for x ticks */
++#define	GEM_RX_BLANKING_TIME_SHIFT 12
++/* One tick is 2048 PCI clocks, or 16us at 66MHz */
++
++/* GEM_MAC registers */
++#define	GEM_MAC_TXRESET		0x6000		/* Store 1, cleared when done */
++#define	GEM_MAC_RXRESET		0x6004		/* ditto */
++#define	GEM_MAC_SEND_PAUSE_CMD	0x6008
++#define	GEM_MAC_TX_STATUS	0x6010
++#define	GEM_MAC_RX_STATUS	0x6014
++#define	GEM_MAC_CONTROL_STATUS	0x6018		/* MAC control status reg */
++#define	GEM_MAC_TX_MASK		0x6020		/* TX MAC mask register */
++#define	GEM_MAC_RX_MASK		0x6024
++#define	GEM_MAC_CONTROL_MASK	0x6028
++#define	GEM_MAC_TX_CONFIG	0x6030
++#define	GEM_MAC_RX_CONFIG	0x6034
++#define	GEM_MAC_CONTROL_CONFIG	0x6038
++#define	GEM_MAC_XIF_CONFIG	0x603c
++#define	GEM_MAC_IPG0		0x6040		/* inter packet gap 0 */
++#define	GEM_MAC_IPG1		0x6044		/* inter packet gap 1 */
++#define	GEM_MAC_IPG2		0x6048		/* inter packet gap 2 */
++#define	GEM_MAC_SLOT_TIME	0x604c		/* slot time, bits 0-7 */
++#define	GEM_MAC_MAC_MIN_FRAME	0x6050
++#define	GEM_MAC_MAC_MAX_FRAME	0x6054
++#define	GEM_MAC_PREAMBLE_LEN	0x6058
++#define	GEM_MAC_JAM_SIZE	0x605c
++#define	GEM_MAC_ATTEMPT_LIMIT	0x6060
++#define	GEM_MAC_CONTROL_TYPE	0x6064
++
++#define	GEM_MAC_ADDR0		0x6080		/* Normal MAC address 0 */
++#define	GEM_MAC_ADDR1		0x6084
++#define	GEM_MAC_ADDR2		0x6088
++#define	GEM_MAC_ADDR3		0x608c		/* Alternate MAC address 0 */
++#define	GEM_MAC_ADDR4		0x6090
++#define	GEM_MAC_ADDR5		0x6094
++#define	GEM_MAC_ADDR6		0x6098		/* Control MAC address 0 */
++#define	GEM_MAC_ADDR7		0x609c
++#define	GEM_MAC_ADDR8		0x60a0
++
++#define	GEM_MAC_ADDR_FILTER0	0x60a4
++#define	GEM_MAC_ADDR_FILTER1	0x60a8
++#define	GEM_MAC_ADDR_FILTER2	0x60ac
++#define	GEM_MAC_ADR_FLT_MASK1_2	0x60b0		/* Address filter mask 1,2 */
++#define	GEM_MAC_ADR_FLT_MASK0	0x60b4		/* Address filter mask 0 reg */
++
++#define	GEM_MAC_HASH0		0x60c0		/* Hash table 0 */
++#define	GEM_MAC_HASH1		0x60c4
++#define	GEM_MAC_HASH2		0x60c8
++#define	GEM_MAC_HASH3		0x60cc
++#define	GEM_MAC_HASH4		0x60d0
++#define	GEM_MAC_HASH5		0x60d4
++#define	GEM_MAC_HASH6		0x60d8
++#define	GEM_MAC_HASH7		0x60dc
++#define	GEM_MAC_HASH8		0x60e0
++#define	GEM_MAC_HASH9		0x60e4
++#define	GEM_MAC_HASH10		0x60e8
++#define	GEM_MAC_HASH11		0x60ec
++#define	GEM_MAC_HASH12		0x60f0
++#define	GEM_MAC_HASH13		0x60f4
++#define	GEM_MAC_HASH14		0x60f8
++#define	GEM_MAC_HASH15		0x60fc
++
++#define	GEM_MAC_NORM_COLL_CNT	0x6100		/* Normal collision counter */
++#define	GEM_MAC_FIRST_COLL_CNT	0x6104		/* 1st successful collision cntr */
++#define	GEM_MAC_EXCESS_COLL_CNT	0x6108		/* Excess collision counter */
++#define	GEM_MAC_LATE_COLL_CNT	0x610c		/* Late collision counter */
++#define	GEM_MAC_DEFER_TMR_CNT	0x6110		/* defer timer counter */
++#define	GEM_MAC_PEAK_ATTEMPTS	0x6114
++#define	GEM_MAC_RX_FRAME_COUNT	0x6118
++#define	GEM_MAC_RX_LEN_ERR_CNT	0x611c
++#define	GEM_MAC_RX_ALIGN_ERR	0x6120
++#define	GEM_MAC_RX_CRC_ERR_CNT	0x6124
++#define	GEM_MAC_RX_CODE_VIOL	0x6128
++#define	GEM_MAC_RANDOM_SEED	0x6130
++#define	GEM_MAC_MAC_STATE	0x6134		/* MAC state machine reg */
++
++/* GEM_MAC_SEND_PAUSE_CMD register bits */
++#define	GEM_MAC_PAUSE_CMD_TIME	0x0000ffff
++#define	GEM_MAC_PAUSE_CMD_SEND	0x00010000
++
++/* GEM_MAC_TX_STATUS and _MASK register bits */
++#define	GEM_MAC_TX_XMIT_DONE	0x00000001
++#define	GEM_MAC_TX_UNDERRUN	0x00000002
++#define	GEM_MAC_TX_PKT_TOO_LONG	0x00000004
++#define	GEM_MAC_TX_NCC_EXP	0x00000008	/* Normal collision cnt exp */
++#define	GEM_MAC_TX_ECC_EXP	0x00000010
++#define	GEM_MAC_TX_LCC_EXP	0x00000020
++#define	GEM_MAC_TX_FCC_EXP	0x00000040
++#define	GEM_MAC_TX_DEFER_EXP	0x00000080
++#define	GEM_MAC_TX_PEAK_EXP	0x00000100
++
++/* GEM_MAC_RX_STATUS and _MASK register bits */
++#define	GEM_MAC_RX_DONE		0x00000001
++#define	GEM_MAC_RX_OVERFLOW	0x00000002
++#define	GEM_MAC_RX_FRAME_CNT	0x00000004
++#define	GEM_MAC_RX_ALIGN_EXP	0x00000008
++#define	GEM_MAC_RX_CRC_EXP	0x00000010
++#define	GEM_MAC_RX_LEN_EXP	0x00000020
++#define	GEM_MAC_RX_CVI_EXP	0x00000040	/* Code violation */
++
++/* GEM_MAC_CONTROL_STATUS and GEM_MAC_CONTROL_MASK register bits */
++#define	GEM_MAC_PAUSED		0x00000001	/* Pause received */
++#define	GEM_MAC_PAUSE		0x00000002	/* enter pause state */
++#define	GEM_MAC_RESUME		0x00000004	/* exit pause state */
++#define	GEM_MAC_PAUSE_TIME_SLTS	0xffff0000	/* pause time in slots */
++#define	GEM_MAC_STATUS_BITS	"\177\020b\0PAUSED\0b\1PAUSE\0b\2RESUME\0\0"
++
++#define	GEM_MAC_PAUSE_TIME_SHFT	16
++#define	GEM_MAC_PAUSE_TIME(x)						\
++	(((x) & GEM_MAC_PAUSE_TIME_SLTS) >> GEM_MAC_PAUSE_TIME_SHFT)
++
++/* GEM_MAC_XIF_CONFIG register bits */
++#define	GEM_MAC_XIF_TX_MII_ENA	0x00000001	/* Enable XIF output drivers */
++#define	GEM_MAC_XIF_MII_LOOPBK	0x00000002	/* Enable MII loopback mode */
++#define	GEM_MAC_XIF_ECHO_DISABL	0x00000004	/* Disable echo */
++#define	GEM_MAC_XIF_GMII_MODE	0x00000008	/* Select GMII/MII mode */
++#define	GEM_MAC_XIF_MII_BUF_ENA	0x00000010	/* Enable MII recv buffers */
++#define	GEM_MAC_XIF_LINK_LED	0x00000020	/* force link LED active */
++#define	GEM_MAC_XIF_FDPLX_LED	0x00000040	/* force FDPLX LED active */
++#define	GEM_MAC_XIF_BITS	"\177\020b\0TXMIIENA\0b\1MIILOOP\0b\2NOECHO" \
++				"\0b\3GMII\0b\4MIIBUFENA\0b\5LINKLED\0" \
++				"b\6FDLED\0\0"
++
++/*
++ * GEM_MAC_SLOT_TIME register
++ * The slot time is used as PAUSE time unit, value depends on whether carrier
++ * extension is enabled.
++ */
++#define	GEM_MAC_SLOT_TIME_CARR_EXTEND	0x200
++#define	GEM_MAC_SLOT_TIME_NORMAL	0x40
++
++/* GEM_MAC_TX_CONFIG register bits */
++#define	GEM_MAC_TX_ENABLE	0x00000001	/* TX enable */
++#define	GEM_MAC_TX_IGN_CARRIER	0x00000002	/* Ignore carrier sense */
++#define	GEM_MAC_TX_IGN_COLLIS	0x00000004	/* ignore collisions */
++#define	GEM_MAC_TX_ENA_IPG0	0x00000008	/* extend RX-to-TX IPG */
++#define	GEM_MAC_TX_NGU		0x00000010	/* Never give up */
++#define	GEM_MAC_TX_NGU_LIMIT	0x00000020	/* Never give up limit */
++#define	GEM_MAC_TX_NO_BACKOFF	0x00000040
++#define	GEM_MAC_TX_SLOWDOWN	0x00000080
++#define	GEM_MAC_TX_NO_FCS	0x00000100	/* no FCS will be generated */
++#define	GEM_MAC_TX_CARR_EXTEND	0x00000200	/* Ena TX Carrier Extension */
++/* Carrier Extension is required for half duplex Gbps operation. */
++#define	GEM_MAC_TX_CONFIG_BITS	"\177\020" \
++				"b\0TXENA\0b\1IGNCAR\0b\2IGNCOLLIS\0" \
++				"b\3IPG0ENA\0b\4TXNGU\0b\5TXNGULIM\0" \
++				"b\6NOBKOFF\0b\7SLOWDN\0b\x8NOFCS\0" \
++				"b\x9TXCARREXT\0\0"
++
++/* GEM_MAC_RX_CONFIG register bits */
++#define	GEM_MAC_RX_ENABLE	0x00000001	/* RX enable */
++#define	GEM_MAC_RX_STRIP_PAD	0x00000002	/* strip pad bytes */
++#define	GEM_MAC_RX_STRIP_CRC	0x00000004
++#define	GEM_MAC_RX_PROMISCUOUS	0x00000008	/* promiscuous mode */
++#define	GEM_MAC_RX_PROMISC_GRP	0x00000010	/* promiscuous group mode */
++#define	GEM_MAC_RX_HASH_FILTER	0x00000020	/* enable hash filter */
++#define	GEM_MAC_RX_ADDR_FILTER	0x00000040	/* enable address filter */
++#define	GEM_MAC_RX_ERRCHK_DIS	0x00000080	/* disable error checking */
++#define	GEM_MAC_RX_CARR_EXTEND	0x00000100	/* Ena RX Carrier Extension */
++/*
++ * Carrier Extension enables reception of packet bursts generated by
++ * senders with carrier extension enabled.
++ */
++#define	GEM_MAC_RX_CONFIG_BITS	"\177\020" \
++				"b\0RXENA\0b\1STRPAD\0b\2STRCRC\0" \
++				"b\3PROMIS\0b\4PROMISCGRP\0b\5HASHFLTR\0" \
++				"b\6ADDRFLTR\0b\7ERRCHKDIS\0b\x9TXCARREXT\0\0"
++
++/* GEM_MAC_CONTROL_CONFIG bits */
++#define	GEM_MAC_CC_TX_PAUSE	0x00000001	/* send pause enabled */
++#define	GEM_MAC_CC_RX_PAUSE	0x00000002	/* receive pause enabled */
++#define	GEM_MAC_CC_PASS_PAUSE	0x00000004	/* pass pause up */
++#define	GEM_MAC_CC_BITS		"\177\020b\0TXPAUSE\0b\1RXPAUSE\0b\2NOPAUSE\0\0"
++
++/*
++ * MIF registers
++ * Bit bang registers use low bit only.
++ */
++#define	GEM_MIF_BB_CLOCK	0x6200		/* bit bang clock */
++#define	GEM_MIF_BB_DATA		0x6204		/* bit bang data */
++#define	GEM_MIF_BB_OUTPUT_ENAB	0x6208
++#define	GEM_MIF_FRAME		0x620c		/* MIF frame - ctl and data */
++#define	GEM_MIF_CONFIG		0x6210
++#define	GEM_MIF_MASK		0x6214
++#define	GEM_MIF_STATUS		0x6218
++#define	GEM_MIF_STATE_MACHINE	0x621c
++
++/* GEM_MIF_FRAME bits */
++#define	GEM_MIF_FRAME_DATA	0x0000ffff
++#define	GEM_MIF_FRAME_TA0	0x00010000	/* TA LSB, 1 for completion */
++#define	GEM_MIF_FRAME_TA1	0x00020000	/* TA MSB, 1 for instruction */
++#define	GEM_MIF_FRAME_REG_ADDR	0x007c0000
++#define	GEM_MIF_FRAME_PHY_ADDR	0x0f800000	/* PHY address */
++#define	GEM_MIF_FRAME_OP	0x30000000	/* operation - write/read */
++#define	GEM_MIF_FRAME_START	0xc0000000	/* START bits */
++
++#define	GEM_MIF_FRAME_READ	0x60020000
++#define	GEM_MIF_FRAME_WRITE	0x50020000
++
++#define	GEM_MIF_REG_SHIFT	18
++#define	GEM_MIF_PHY_SHIFT	23
++
++/* GEM_MIF_CONFIG register bits */
++#define	GEM_MIF_CONFIG_PHY_SEL	0x00000001	/* PHY select, 0: MDIO_0 */
++#define	GEM_MIF_CONFIG_POLL_ENA	0x00000002	/* poll enable */
++#define	GEM_MIF_CONFIG_BB_ENA	0x00000004	/* bit bang enable */
++#define	GEM_MIF_CONFIG_REG_ADR	0x000000f8	/* poll register address */
++#define	GEM_MIF_CONFIG_MDI0	0x00000100	/* MDIO_0 attached/data */
++#define	GEM_MIF_CONFIG_MDI1	0x00000200	/* MDIO_1 attached/data */
++#define	GEM_MIF_CONFIG_PHY_ADR	0x00007c00	/* poll PHY address */
++/* MDI0 is the onboard transceiver, MDI1 is external, PHYAD for both is 0. */
++#define	GEM_MIF_CONFIG_BITS	"\177\020b\0PHYSEL\0b\1POLL\0b\2BBENA\0" \
++				"b\x8MDIO0\0b\x9MDIO1\0\0"
++
++/* GEM_MIF_STATUS and GEM_MIF_MASK bits */
++#define	GEM_MIF_POLL_STATUS_MASK	0x0000ffff	/* polling status */
++#define	GEM_MIF_POLL_STATUS_SHFT	0
++#define	GEM_MIF_POLL_DATA_MASK		0xffff0000	/* polling data */
++#define	GEM_MIF_POLL_DATA_SHFT		8
++/*
++ * The Basic part is the last value read in the POLL field of the config
++ * register.
++ * The status part indicates the bits that have changed.
++ */
++
++/* GEM PCS/Serial link registers */
++#define	GEM_MII_CONTROL		0x9000
++#define	GEM_MII_STATUS		0x9004
++#define	GEM_MII_ANAR		0x9008		/* MII advertisement reg */
++#define	GEM_MII_ANLPAR		0x900c		/* Link Partner Ability Reg */
++#define	GEM_MII_CONFIG		0x9010
++#define	GEM_MII_STATE_MACHINE	0x9014
++#define	GEM_MII_INTERRUP_STATUS	0x9018		/* PCS interrupt state */
++#define	GEM_MII_DATAPATH_MODE	0x9050
++#define	GEM_MII_SLINK_CONTROL	0x9054		/* Serial link control */
++#define	GEM_MII_OUTPUT_SELECT	0x9058
++#define	GEM_MII_SLINK_STATUS	0x905c		/* Serialink status */
++
++/* GEM_MII_CONTROL bits - PCS "BMCR" (Basic Mode Control Reg) */
++#define	GEM_MII_CONTROL_1000M	0x00000040	/* 1000Mbps speed select */
++#define	GEM_MII_CONTROL_COL_TST	0x00000080	/* collision test */
++#define	GEM_MII_CONTROL_FDUPLEX	0x00000100	/* full-duplex, always 0 */
++#define	GEM_MII_CONTROL_RAN	0x00000200	/* restart auto-negotiation */
++#define	GEM_MII_CONTROL_ISOLATE	0x00000400	/* isolate PHY from MII */
++#define	GEM_MII_CONTROL_POWERDN	0x00000800	/* power down */
++#define	GEM_MII_CONTROL_AUTONEG	0x00001000	/* auto-negotiation enable */
++#define	GEM_MII_CONTROL_10_100M	0x00002000	/* 10/100Mbps speed select */
++#define	GEM_MII_CONTROL_LOOPBK	0x00004000	/* 10-bit i/f loopback */
++#define	GEM_MII_CONTROL_RESET	0x00008000	/* Reset PCS. */
++#define	GEM_MII_CONTROL_BITS	"\177\020b\7COLTST\0b\x8_FD\0b\x9RAN\0" \
++				"b\xaISOLATE\0b\xbPWRDWN\0b\xc_ANEG\0" \
++				"b\xdGIGE\0b\xeLOOP\0b\xfRESET\0\0"
++
++/* GEM_MII_STATUS reg - PCS "BMSR" (Basic Mode Status Reg) */
++#define	GEM_MII_STATUS_EXTCAP	0x00000001	/* extended capability */
++#define	GEM_MII_STATUS_JABBER	0x00000002	/* jabber condition detected */
++#define	GEM_MII_STATUS_LINK_STS	0x00000004	/* link status */
++#define	GEM_MII_STATUS_ACFG	0x00000008	/* can auto-negotiate */
++#define	GEM_MII_STATUS_REM_FLT	0x00000010	/* remote fault detected */
++#define	GEM_MII_STATUS_ANEG_CPT	0x00000020	/* auto-negotiate complete */
++#define	GEM_MII_STATUS_EXTENDED	0x00000100	/* extended status */
++#define	GEM_MII_STATUS_BITS	"\177\020b\0EXTCAP\0b\1JABBER\0b\2LINKSTS\0" \
++				"b\3ACFG\0b\4REMFLT\0b\5ANEGCPT\0\0"
++
++/* GEM_MII_ANAR and GEM_MII_ANLPAR reg bits */
++#define	GEM_MII_ANEG_FDUPLX	0x00000020	/* full-duplex */
++#define	GEM_MII_ANEG_HDUPLX	0x00000040	/* half-duplex */
++#define	GEM_MII_ANEG_PAUSE	0x00000080	/* symmetric PAUSE */
++#define	GEM_MII_ANEG_ASM_DIR	0x00000100	/* asymmetric PAUSE */
++#define	GEM_MII_ANEG_RFLT_FAIL	0x00001000	/* remote fault - fail */
++#define	GEM_MII_ANEG_RFLT_OFF	0x00002000	/* remote fault - off-line */
++#define	GEM_MII_ANEG_RFLT_MASK						\
++(CAS_PCS_ANEG_RFLT_FAIL | CAS_PCS_ANEG_RFLT_OFF)
++#define	GEM_MII_ANEG_ACK	0x00004000	/* acknowledge */
++#define	GEM_MII_ANEG_NP		0x00008000	/* next page */
++#define	GEM_MII_ANEG_BITS	"\177\020b\5FDX\0b\6HDX\0b\7SYMPAUSE\0" \
++				"\b\x8_ASYMPAUSE\0\b\xdREMFLT\0\b\xeLPACK\0" \
++				"\b\xfNPBIT\0\0"
++
++/* GEM_MII_CONFIG reg */
++#define	GEM_MII_CONFIG_ENABLE	0x00000001	/* Enable PCS. */
++#define	GEM_MII_CONFIG_SDO	0x00000002	/* signal detect override */
++#define	GEM_MII_CONFIG_SDL	0x00000004	/* signal detect active-low */
++#define	GEM_MII_CONFIG_JS_NORM	0x00000000	/* jitter study - normal op. */
++#define	GEM_MII_CONFIG_JS_HF	0x00000008	/* jitter study - HF test */
++#define	GEM_MII_CONFIG_JS_LF	0x00000010	/* jitter study - LF test */
++#define	GEM_MII_CONFIG_JS_MASK						\
++	(GEM_MII_CONFIG_JS_HF | GEM_MII_CONFIG_JS_LF)
++#define	GEM_MII_CONFIG_ANTO	0x00000020	/* auto-neg. timer override */
++#define	GEM_MII_CONFIG_BITS	"\177\020b\0PCSENA\0\0"
++
++/*
++ * GEM_MII_INTERRUP_STATUS reg
++ * No mask register; mask with the global interrupt mask register.
++ */
++#define	GEM_MII_INTERRUP_LINK	0x00000004	/* PCS link status change */
++
++/* GEM_MII_DATAPATH_MODE reg */
++#define	GEM_MII_DATAPATH_SERIAL	0x00000001	/* Serialink */
++#define	GEM_MII_DATAPATH_SERDES	0x00000002	/* SERDES via 10-bit */
++#define	GEM_MII_DATAPATH_MII	0x00000004	/* GMII/MII */
++#define	GEM_MII_DATAPATH_GMIIOE	0x00000008	/* serial output on GMII en. */
++#define	GEM_MII_DATAPATH_BITS	"\177\020"	\
++				"b\0SERIAL\0b\1SERDES\0b\2MII\0b\3GMIIOE\0\0"
++
++/* GEM_MII_SLINK_CONTROL reg */
++#define	GEM_MII_SLINK_LOOPBACK	0x00000001	/* enable loopback at SL, logic
++						 * reversed for SERDES */
++#define	GEM_MII_SLINK_EN_SYNC_D	0x00000002	/* enable sync detection */
++#define	GEM_MII_SLINK_LOCK_REF	0x00000004	/* lock to reference clock */
++#define	GEM_MII_SLINK_EMPHASIS	0x00000018	/* enable emphasis */
++#define	GEM_MII_SLINK_SELFTEST	0x000001c0	/* self-test */
++#define	GEM_MII_SLINK_POWER_OFF	0x00000200	/* Power down Serialink. */
++#define	GEM_MII_SLINK_RX_ZERO	0x00000c00	/* PLL input to Serialink. */
++#define	GEM_MII_SLINK_RX_POLE	0x00003000	/* PLL input to Serialink. */
++#define	GEM_MII_SLINK_TX_ZERO	0x0000c000	/* PLL input to Serialink. */
++#define	GEM_MII_SLINK_TX_POLE	0x00030000	/* PLL input to Serialink. */
++#define	GEM_MII_SLINK_CONTROL_BITS		\
++				"\177\020b\0LOOP\0b\1ENASYNC\0b\2LOCKREF" \
++				"\0b\3EMPHASIS\0b\x9PWRDWN\0\0"
++
++/* GEM_MII_SLINK_STATUS reg */
++#define	GEM_MII_SLINK_TEST	0x00000000	/* undergoing test */
++#define	GEM_MII_SLINK_LOCKED	0x00000001	/* waiting 500us w/ lockrefn */
++#define	GEM_MII_SLINK_COMMA	0x00000002	/* waiting for comma detect */
++#define	GEM_MII_SLINK_SYNC	0x00000003	/* recv data synchronized */
++
++/*
++ * PCI Expansion ROM runtime access
++ * Sun GEMs map a 1MB space for the PCI Expansion ROM as the second half
++ * of the register bank, although they only support up to 64KB ROMs.
++ */
++#define	GEM_PCI_ROM_OFFSET	0x100000
++#define	GEM_PCI_ROM_SIZE	0x10000
++
++/* Wired PHY addresses */
++#define	GEM_PHYAD_INTERNAL	1
++#define	GEM_PHYAD_EXTERNAL	0
++
++/*
++ * descriptor table structures
++ */
++struct gem_desc {
++	uint64_t	gd_flags;
++	uint64_t	gd_addr;
++};
++
++/*
++ * Transmit flags
++ * GEM_TD_CXSUM_ENABLE, GEM_TD_CXSUM_START, GEM_TD_CXSUM_STUFF and
++ * GEM_TD_INTERRUPT_ME only need to be set in the first descriptor of a group.
++ */
++#define	GEM_TD_BUFSIZE		0x0000000000007fffULL
++#define	GEM_TD_CXSUM_START	0x00000000001f8000ULL	/* Cxsum start offset */
++#define	GEM_TD_CXSUM_STARTSHFT	15
++#define	GEM_TD_CXSUM_STUFF	0x000000001fe00000ULL	/* Cxsum stuff offset */
++#define	GEM_TD_CXSUM_STUFFSHFT	21
++#define	GEM_TD_CXSUM_ENABLE	0x0000000020000000ULL	/* Cxsum generation enable */
++#define	GEM_TD_END_OF_PACKET	0x0000000040000000ULL
++#define	GEM_TD_START_OF_PACKET	0x0000000080000000ULL
++#define	GEM_TD_INTERRUPT_ME	0x0000000100000000ULL	/* Interrupt me now */
++#define	GEM_TD_NO_CRC		0x0000000200000000ULL	/* do not insert crc */
++
++/* Receive flags */
++#define	GEM_RD_CHECKSUM		0x000000000000ffffULL	/* is the complement */
++#define	GEM_RD_BUFSIZE		0x000000007fff0000ULL
++#define	GEM_RD_OWN		0x0000000080000000ULL	/* 1 - owned by h/w */
++#define	GEM_RD_HASHVAL		0x0ffff00000000000ULL
++#define	GEM_RD_HASH_PASS	0x1000000000000000ULL	/* passed hash filter */
++#define	GEM_RD_ALTERNATE_MAC	0x2000000000000000ULL	/* Alternate MAC adrs */
++#define	GEM_RD_BAD_CRC		0x4000000000000000ULL
++#define	GEM_RD_BUFSHIFT		16
++#define	GEM_RD_BUFLEN(x)	(((x) & GEM_RD_BUFSIZE) >> GEM_RD_BUFSHIFT)
++
++#endif
+diff --git a/freebsd/sys/dev/gem/if_gemvar.h b/freebsd/sys/dev/gem/if_gemvar.h
+new file mode 100644
+index 00000000..6c8aeee2
+--- /dev/null
++++ b/freebsd/sys/dev/gem/if_gemvar.h
+@@ -0,0 +1,264 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (C) 2001 Eduardo Horvath.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR  ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR  BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ *
++ *	from: NetBSD: gemvar.h,v 1.8 2002/05/15 02:36:12 matt Exp
++ */
++
++#ifndef	_IF_GEMVAR_H
++#define	_IF_GEMVAR_H
++
++#include <sys/queue.h>
++#include <sys/callout.h>
++
++/*
++ * Transmit descriptor ring size - this is arbitrary, but allocate
++ * enough descriptors for 64 pending transmissions and 16 segments
++ * per packet.  This limit is not actually enforced (packets with
++ * more segments can be sent, depending on the busdma backend); it
++ * is however used as an estimate for the TX window size.
++ */
++#define	GEM_NTXSEGS		16
++
++#define	GEM_TXQUEUELEN		64
++#define	GEM_NTXDESC		(GEM_TXQUEUELEN * GEM_NTXSEGS)
++#define	GEM_MAXTXFREE		(GEM_NTXDESC - 1)
++#define	GEM_NTXDESC_MASK	(GEM_NTXDESC - 1)
++#define	GEM_NEXTTX(x)		((x + 1) & GEM_NTXDESC_MASK)
++
++/*
++ * Receive descriptor ring size - we have one RX buffer per incoming
++ * packet, so this logic is a little simpler.
++ */
++#define	GEM_NRXDESC		256
++#define	GEM_NRXDESC_MASK	(GEM_NRXDESC - 1)
++#define	GEM_NEXTRX(x)		((x + 1) & GEM_NRXDESC_MASK)
++
++/*
++ * How many ticks to wait until to retry on a RX descriptor that is
++ * still owned by the hardware.
++ */
++#define	GEM_RXOWN_TICKS		(hz / 50)
++
++/*
++ * Control structures are DMA'd to the chip.  We allocate them
++ * in a single clump that maps to a single DMA segment to make
++ * several things easier.
++ */
++struct gem_control_data {
++	struct gem_desc gcd_txdescs[GEM_NTXDESC];	/* TX descriptors */
++	struct gem_desc gcd_rxdescs[GEM_NRXDESC];	/* RX descriptors */
++};
++
++#define	GEM_CDOFF(x)		offsetof(struct gem_control_data, x)
++#define	GEM_CDTXOFF(x)		GEM_CDOFF(gcd_txdescs[(x)])
++#define	GEM_CDRXOFF(x)		GEM_CDOFF(gcd_rxdescs[(x)])
++
++/*
++ * software state for transmit job mbufs (may be elements of mbuf chains)
++ */
++struct gem_txsoft {
++	struct mbuf *txs_mbuf;		/* head of our mbuf chain */
++	bus_dmamap_t txs_dmamap;	/* our DMA map */
++	u_int txs_firstdesc;		/* first descriptor in packet */
++	u_int txs_lastdesc;		/* last descriptor in packet */
++	u_int txs_ndescs;		/* number of descriptors */
++	STAILQ_ENTRY(gem_txsoft) txs_q;
++};
++
++STAILQ_HEAD(gem_txsq, gem_txsoft);
++
++/*
++ * software state for receive jobs
++ */
++struct gem_rxsoft {
++	struct mbuf *rxs_mbuf;		/* head of our mbuf chain */
++	bus_dmamap_t rxs_dmamap;	/* our DMA map */
++	bus_addr_t rxs_paddr;		/* physical address of the segment */
++};
++
++/*
++ * software state per device
++ */
++struct gem_softc {
++	if_t		sc_ifp;
++	struct mtx	sc_mtx;
++	device_t	sc_miibus;
++	struct mii_data	*sc_mii;	/* MII media control */
++	device_t	sc_dev;		/* generic device information */
++	u_char		sc_enaddr[ETHER_ADDR_LEN];
++	struct callout	sc_tick_ch;	/* tick callout */
++	struct callout	sc_rx_ch;	/* delayed RX callout */
++	u_int		sc_wdog_timer;	/* watchdog timer */
++
++	void		*sc_ih;
++	struct resource *sc_res[2];
++#define	GEM_RES_INTR		0
++#define	GEM_RES_MEM		1
++
++	bus_dma_tag_t	sc_pdmatag;	/* parent bus DMA tag */
++	bus_dma_tag_t	sc_rdmatag;	/* RX bus DMA tag */
++	bus_dma_tag_t	sc_tdmatag;	/* TX bus DMA tag */
++	bus_dma_tag_t	sc_cdmatag;	/* control data bus DMA tag */
++	bus_dmamap_t	sc_dmamap;	/* bus DMA handle */
++
++	u_int		sc_variant;
++#define	GEM_UNKNOWN		0	/* don't know */
++#define	GEM_SUN_GEM		1	/* Sun GEM */
++#define	GEM_APPLE_GMAC		2	/* Apple GMAC */
++#define	GEM_APPLE_K2_GMAC	3	/* Apple K2 GMAC */
++
++#define	GEM_IS_APPLE(sc)						\
++	((sc)->sc_variant == GEM_APPLE_GMAC ||				\
++	(sc)->sc_variant == GEM_APPLE_K2_GMAC)
++
++	u_int		sc_flags;
++#define	GEM_INITED	(1 << 0)	/* reset persistent regs init'ed */
++#define	GEM_LINK	(1 << 1)	/* link is up */
++#define	GEM_PCI66	(1 << 2)	/* PCI bus runs at 66MHz */
++#define	GEM_SERDES	(1 << 3)	/* use the SERDES */
++
++	/*
++	 * ring buffer DMA stuff
++	 */
++	bus_dmamap_t	sc_cddmamap;	/* control data DMA map */
++	bus_addr_t	sc_cddma;
++
++	/*
++	 * software state for transmit and receive descriptors
++	 */
++	struct gem_txsoft sc_txsoft[GEM_TXQUEUELEN];
++	struct gem_rxsoft sc_rxsoft[GEM_NRXDESC];
++
++	/*
++	 * control data structures
++	 */
++	struct gem_control_data *sc_control_data;
++#define	sc_txdescs	sc_control_data->gcd_txdescs
++#define	sc_rxdescs	sc_control_data->gcd_rxdescs
++
++	u_int		sc_txfree;	/* number of free TX descriptors */
++	u_int		sc_txnext;	/* next ready TX descriptor */
++	u_int		sc_txwin;	/* TX desc. since last TX intr. */
++
++	struct gem_txsq	sc_txfreeq;	/* free TX descsofts */
++	struct gem_txsq	sc_txdirtyq;	/* dirty TX descsofts */
++
++	u_int		sc_rxptr;	/* next ready RX descriptor/state */
++	u_int		sc_rxfifosize;	/* RX FIFO size (bytes) */
++
++	uint32_t	sc_mac_rxcfg;	/* RX MAC conf. % GEM_MAC_RX_ENABLE */
++
++	int		sc_ifflags;
++	u_long		sc_csum_features;
++};
++
++#define	GEM_BARRIER(sc, offs, len, flags)				\
++	bus_barrier((sc)->sc_res[GEM_RES_MEM], (offs), (len), (flags))
++
++#define	GEM_READ_N(n, sc, offs)						\
++	bus_read_ ## n((sc)->sc_res[GEM_RES_MEM], (offs))
++#define	GEM_READ_1(sc, offs)						\
++	GEM_READ_N(1, (sc), (offs))
++#define	GEM_READ_2(sc, offs)						\
++	GEM_READ_N(2, (sc), (offs))
++#define	GEM_READ_4(sc, offs)						\
++	GEM_READ_N(4, (sc), (offs))
++#define	GEM_READ_1(sc, offs)						\
++	GEM_READ_N(1, (sc), (offs))
++#define	GEM_READ_2(sc, offs)						\
++	GEM_READ_N(2, (sc), (offs))
++#define	GEM_READ_4(sc, offs)						\
++	GEM_READ_N(4, (sc), (offs))
++
++#define	GEM_WRITE_N(n, sc, offs, v)					\
++	bus_write_ ## n((sc)->sc_res[GEM_RES_MEM], (offs), (v))
++#define	GEM_WRITE_1(sc, offs, v)					\
++	GEM_WRITE_N(1, (sc), (offs), (v))
++#define	GEM_WRITE_2(sc, offs, v)					\
++	GEM_WRITE_N(2, (sc), (offs), (v))
++#define	GEM_WRITE_4(sc, offs, v)					\
++	GEM_WRITE_N(4, (sc), (offs), (v))
++#define	GEM_WRITE_1(sc, offs, v)					\
++	GEM_WRITE_N(1, (sc), (offs), (v))
++#define	GEM_WRITE_2(sc, offs, v)					\
++	GEM_WRITE_N(2, (sc), (offs), (v))
++#define	GEM_WRITE_4(sc, offs, v)					\
++	GEM_WRITE_N(4, (sc), (offs), (v))
++
++#define	GEM_CDTXADDR(sc, x)	((sc)->sc_cddma + GEM_CDTXOFF((x)))
++#define	GEM_CDRXADDR(sc, x)	((sc)->sc_cddma + GEM_CDRXOFF((x)))
++
++#define	GEM_CDSYNC(sc, ops)						\
++	bus_dmamap_sync((sc)->sc_cdmatag, (sc)->sc_cddmamap, (ops));
++
++#define	GEM_INIT_RXDESC(sc, x)						\
++do {									\
++	struct gem_rxsoft *__rxs = &sc->sc_rxsoft[(x)];			\
++	struct gem_desc *__rxd = &sc->sc_rxdescs[(x)];			\
++	struct mbuf *__m = __rxs->rxs_mbuf;				\
++									\
++	__m->m_data = __m->m_ext.ext_buf;				\
++	__rxd->gd_addr = htole64(__rxs->rxs_paddr);			\
++	__rxd->gd_flags = htole64((((__m->m_ext.ext_size) <<		\
++	    GEM_RD_BUFSHIFT) & GEM_RD_BUFSIZE) | GEM_RD_OWN);		\
++} while (0)
++
++#define	GEM_UPDATE_RXDESC(sc, x)					\
++do {									\
++	struct gem_rxsoft *__rxs = &sc->sc_rxsoft[(x)];			\
++	struct gem_desc *__rxd = &sc->sc_rxdescs[(x)];			\
++	struct mbuf *__m = __rxs->rxs_mbuf;				\
++									\
++	__rxd->gd_flags = htole64((((__m->m_ext.ext_size) <<		\
++	    GEM_RD_BUFSHIFT) & GEM_RD_BUFSIZE) | GEM_RD_OWN);		\
++} while (0)
++
++#define	GEM_LOCK_INIT(_sc, _name)					\
++	mtx_init(&(_sc)->sc_mtx, _name, MTX_NETWORK_LOCK, MTX_DEF)
++#define	GEM_LOCK(_sc)			mtx_lock(&(_sc)->sc_mtx)
++#define	GEM_UNLOCK(_sc)			mtx_unlock(&(_sc)->sc_mtx)
++#define	GEM_LOCK_ASSERT(_sc, _what)	mtx_assert(&(_sc)->sc_mtx, (_what))
++#define	GEM_LOCK_DESTROY(_sc)		mtx_destroy(&(_sc)->sc_mtx)
++
++#ifdef _KERNEL
++int	gem_attach(struct gem_softc *sc);
++void	gem_detach(struct gem_softc *sc);
++void	gem_intr(void *v);
++void	gem_resume(struct gem_softc *sc);
++void	gem_suspend(struct gem_softc *sc);
++
++int	gem_mediachange(if_t ifp);
++void	gem_mediastatus(if_t ifp, struct ifmediareq *ifmr);
++
++/* MII methods & callbacks */
++int	gem_mii_readreg(device_t dev, int phy, int reg);
++void	gem_mii_statchg(device_t dev);
++int	gem_mii_writereg(device_t dev, int phy, int reg, int val);
++
++#endif /* _KERNEL */
++
++#endif
+diff --git a/freebsd/sys/dev/usb/controller/ohci_pci.c b/freebsd/sys/dev/usb/controller/ohci_pci.c
+new file mode 100644
+index 00000000..8ec76501
+--- /dev/null
++++ b/freebsd/sys/dev/usb/controller/ohci_pci.c
+@@ -0,0 +1,379 @@
++#include <machine/rtems-bsd-kernel-space.h>
++
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 1998 The NetBSD Foundation, Inc.
++ * All rights reserved.
++ *
++ * This code is derived from software contributed to The NetBSD Foundation
++ * by Lennart Augustsson (augustss@carlstedt.se) at
++ * Carlstedt Research & Technology.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
++ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
++ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
++ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++/*
++ * USB Open Host Controller driver.
++ *
++ * OHCI spec: http://www.intel.com/design/usb/ohci11d.pdf
++ */
++
++/* The low level controller code for OHCI has been split into
++ * PCI probes and OHCI specific code. This was done to facilitate the
++ * sharing of code between *BSD's
++ */
++
++#include <sys/stdint.h>
++#include <sys/stddef.h>
++#include <sys/param.h>
++#include <sys/queue.h>
++#include <sys/types.h>
++#include <sys/systm.h>
++#include <sys/kernel.h>
++#include <sys/bus.h>
++#include <sys/module.h>
++#include <sys/lock.h>
++#include <sys/mutex.h>
++#include <sys/condvar.h>
++#include <sys/sysctl.h>
++#include <sys/sx.h>
++#include <sys/unistd.h>
++#include <sys/callout.h>
++#include <sys/malloc.h>
++#include <sys/priv.h>
++
++#include <dev/usb/usb.h>
++#include <dev/usb/usbdi.h>
++
++#include <dev/usb/usb_core.h>
++#include <dev/usb/usb_busdma.h>
++#include <dev/usb/usb_process.h>
++#include <dev/usb/usb_util.h>
++
++#include <dev/usb/usb_controller.h>
++#include <dev/usb/usb_bus.h>
++#include <dev/usb/usb_pci.h>
++#include <dev/usb/controller/ohci.h>
++#include <dev/usb/controller/ohcireg.h>
++#include <rtems/bsd/local/usb_if.h>
++
++#define	PCI_OHCI_VENDORID_ACERLABS	0x10b9
++#define	PCI_OHCI_VENDORID_AMD		0x1022
++#define	PCI_OHCI_VENDORID_APPLE		0x106b
++#define	PCI_OHCI_VENDORID_ATI		0x1002
++#define	PCI_OHCI_VENDORID_CMDTECH	0x1095
++#define	PCI_OHCI_VENDORID_HYGON		0x1d94
++#define	PCI_OHCI_VENDORID_NEC		0x1033
++#define	PCI_OHCI_VENDORID_NVIDIA	0x12D2
++#define	PCI_OHCI_VENDORID_NVIDIA2	0x10DE
++#define	PCI_OHCI_VENDORID_OPTI		0x1045
++#define	PCI_OHCI_VENDORID_SIS		0x1039
++
++#define	PCI_OHCI_BASE_REG	0x10
++
++static device_probe_t ohci_pci_probe;
++static device_attach_t ohci_pci_attach;
++static device_detach_t ohci_pci_detach;
++static usb_take_controller_t ohci_pci_take_controller;
++
++static int
++ohci_pci_take_controller(device_t self)
++{
++	uint32_t reg;
++	uint32_t int_line;
++
++	if (pci_get_powerstate(self) != PCI_POWERSTATE_D0) {
++		device_printf(self, "chip is in D%d mode "
++		    "-- setting to D0\n", pci_get_powerstate(self));
++		reg = pci_read_config(self, PCI_CBMEM, 4);
++		int_line = pci_read_config(self, PCIR_INTLINE, 4);
++		pci_set_powerstate(self, PCI_POWERSTATE_D0);
++		pci_write_config(self, PCI_CBMEM, reg, 4);
++		pci_write_config(self, PCIR_INTLINE, int_line, 4);
++	}
++	return (0);
++}
++
++static const char *
++ohci_pci_match(device_t self)
++{
++	uint32_t device_id = pci_get_devid(self);
++
++	switch (device_id) {
++	case 0x523710b9:
++		return ("AcerLabs M5237 (Aladdin-V) USB controller");
++
++	case 0x740c1022:
++		return ("AMD-756 USB Controller");
++	case 0x74141022:
++		return ("AMD-766 USB Controller");
++	case 0x78071022:
++		return ("AMD FCH USB Controller");
++
++	case 0x43741002:
++		return "ATI SB400 USB Controller";
++	case 0x43751002:
++		return "ATI SB400 USB Controller";
++	case 0x43971002:
++		return ("AMD SB7x0/SB8x0/SB9x0 USB controller");
++	case 0x43981002:
++		return ("AMD SB7x0/SB8x0/SB9x0 USB controller");
++	case 0x43991002:
++		return ("AMD SB7x0/SB8x0/SB9x0 USB controller");
++
++	case 0x06701095:
++		return ("CMD Tech 670 (USB0670) USB controller");
++
++	case 0x06731095:
++		return ("CMD Tech 673 (USB0673) USB controller");
++
++	case 0xc8611045:
++		return ("OPTi 82C861 (FireLink) USB controller");
++
++	case 0x00351033:
++		return ("NEC uPD 9210 USB controller");
++
++	case 0x00d710de:
++		return ("nVidia nForce3 USB Controller");
++
++	case 0x005a10de:
++		return ("nVidia nForce CK804 USB Controller");
++	case 0x036c10de:
++		return ("nVidia nForce MCP55 USB Controller");
++	case 0x03f110de:
++		return ("nVidia nForce MCP61 USB Controller");
++	case 0x0aa510de:
++		return ("nVidia nForce MCP79 USB Controller");
++	case 0x0aa710de:
++		return ("nVidia nForce MCP79 USB Controller");
++	case 0x0aa810de:
++		return ("nVidia nForce MCP79 USB Controller");
++
++	case 0x70011039:
++		return ("SiS 5571 USB controller");
++
++	case 0x0019106b:
++		return ("Apple KeyLargo USB controller");
++	case 0x003f106b:
++		return ("Apple KeyLargo/Intrepid USB controller");
++
++	default:
++		break;
++	}
++	if ((pci_get_class(self) == PCIC_SERIALBUS) &&
++	    (pci_get_subclass(self) == PCIS_SERIALBUS_USB) &&
++	    (pci_get_progif(self) == PCI_INTERFACE_OHCI)) {
++		return ("OHCI (generic) USB controller");
++	}
++	return (NULL);
++}
++
++static int
++ohci_pci_probe(device_t self)
++{
++	const char *desc = ohci_pci_match(self);
++
++	if (desc) {
++		device_set_desc(self, desc);
++		return (0);
++	} else {
++		return (ENXIO);
++	}
++}
++
++static int
++ohci_pci_attach(device_t self)
++{
++	ohci_softc_t *sc = device_get_softc(self);
++	int rid;
++	int err;
++
++	/* initialise some bus fields */
++	sc->sc_bus.parent = self;
++	sc->sc_bus.devices = sc->sc_devices;
++	sc->sc_bus.devices_max = OHCI_MAX_DEVICES;
++	sc->sc_bus.dma_bits = 32;
++
++	/* get all DMA memory */
++	if (usb_bus_mem_alloc_all(&sc->sc_bus, USB_GET_DMA_TAG(self),
++	    &ohci_iterate_hw_softc)) {
++		return (ENOMEM);
++	}
++	sc->sc_dev = self;
++
++	pci_enable_busmaster(self);
++
++	rid = PCI_CBMEM;
++	sc->sc_io_res = bus_alloc_resource_any(self, SYS_RES_MEMORY, &rid,
++	    RF_ACTIVE);
++	if (!sc->sc_io_res) {
++		device_printf(self, "Could not map memory\n");
++		goto error;
++	}
++	sc->sc_io_tag = rman_get_bustag(sc->sc_io_res);
++	sc->sc_io_hdl = rman_get_bushandle(sc->sc_io_res);
++	sc->sc_io_size = rman_get_size(sc->sc_io_res);
++
++	rid = 0;
++	sc->sc_irq_res = bus_alloc_resource_any(self, SYS_RES_IRQ, &rid,
++	    RF_SHAREABLE | RF_ACTIVE);
++	if (sc->sc_irq_res == NULL) {
++		device_printf(self, "Could not allocate irq\n");
++		goto error;
++	}
++	sc->sc_bus.bdev = device_add_child(self, "usbus", -1);
++	if (!sc->sc_bus.bdev) {
++		device_printf(self, "Could not add USB device\n");
++		goto error;
++	}
++	device_set_ivars(sc->sc_bus.bdev, &sc->sc_bus);
++
++	/*
++	 * ohci_pci_match will never return NULL if ohci_pci_probe
++	 * succeeded
++	 */
++	device_set_desc(sc->sc_bus.bdev, ohci_pci_match(self));
++	switch (pci_get_vendor(self)) {
++	case PCI_OHCI_VENDORID_ACERLABS:
++		sprintf(sc->sc_vendor, "AcerLabs");
++		break;
++	case PCI_OHCI_VENDORID_AMD:
++		sprintf(sc->sc_vendor, "AMD");
++		break;
++	case PCI_OHCI_VENDORID_APPLE:
++		sprintf(sc->sc_vendor, "Apple");
++		break;
++	case PCI_OHCI_VENDORID_ATI:
++		sprintf(sc->sc_vendor, "ATI");
++		break;
++	case PCI_OHCI_VENDORID_CMDTECH:
++		sprintf(sc->sc_vendor, "CMDTECH");
++		break;
++	case PCI_OHCI_VENDORID_HYGON:
++		sprintf(sc->sc_vendor, "Hygon");
++		break;
++	case PCI_OHCI_VENDORID_NEC:
++		sprintf(sc->sc_vendor, "NEC");
++		break;
++	case PCI_OHCI_VENDORID_NVIDIA:
++	case PCI_OHCI_VENDORID_NVIDIA2:
++		sprintf(sc->sc_vendor, "nVidia");
++		break;
++	case PCI_OHCI_VENDORID_OPTI:
++		sprintf(sc->sc_vendor, "OPTi");
++		break;
++	case PCI_OHCI_VENDORID_SIS:
++		sprintf(sc->sc_vendor, "SiS");
++		break;
++	default:
++		if (bootverbose) {
++			device_printf(self, "(New OHCI DeviceId=0x%08x)\n",
++			    pci_get_devid(self));
++		}
++		sprintf(sc->sc_vendor, "(0x%04x)", pci_get_vendor(self));
++	}
++
++	/* sc->sc_bus.usbrev; set by ohci_init() */
++
++	err = bus_setup_intr(self, sc->sc_irq_res, INTR_TYPE_BIO | INTR_MPSAFE,
++	    NULL, (driver_intr_t *)ohci_interrupt, sc, &sc->sc_intr_hdl);
++	if (err) {
++		device_printf(self, "Could not setup irq, %d\n", err);
++		sc->sc_intr_hdl = NULL;
++		goto error;
++	}
++	err = ohci_init(sc);
++	if (!err) {
++		err = device_probe_and_attach(sc->sc_bus.bdev);
++	}
++	if (err) {
++		device_printf(self, "USB init failed\n");
++		goto error;
++	}
++	return (0);
++
++error:
++	ohci_pci_detach(self);
++	return (ENXIO);
++}
++
++static int
++ohci_pci_detach(device_t self)
++{
++	ohci_softc_t *sc = device_get_softc(self);
++
++	/* during module unload there are lots of children leftover */
++	device_delete_children(self);
++
++	pci_disable_busmaster(self);
++
++	if (sc->sc_irq_res && sc->sc_intr_hdl) {
++		/*
++		 * only call ohci_detach() after ohci_init()
++		 */
++		ohci_detach(sc);
++
++		int err = bus_teardown_intr(self, sc->sc_irq_res, sc->sc_intr_hdl);
++
++		if (err) {
++			/* XXX or should we panic? */
++			device_printf(self, "Could not tear down irq, %d\n",
++			    err);
++		}
++		sc->sc_intr_hdl = NULL;
++	}
++	if (sc->sc_irq_res) {
++		bus_release_resource(self, SYS_RES_IRQ, 0, sc->sc_irq_res);
++		sc->sc_irq_res = NULL;
++	}
++	if (sc->sc_io_res) {
++		bus_release_resource(self, SYS_RES_MEMORY, PCI_CBMEM,
++		    sc->sc_io_res);
++		sc->sc_io_res = NULL;
++	}
++	usb_bus_mem_free_all(&sc->sc_bus, &ohci_iterate_hw_softc);
++
++	return (0);
++}
++
++static device_method_t ohci_pci_methods[] = {
++	/* Device interface */
++	DEVMETHOD(device_probe, ohci_pci_probe),
++	DEVMETHOD(device_attach, ohci_pci_attach),
++	DEVMETHOD(device_detach, ohci_pci_detach),
++	DEVMETHOD(device_suspend, bus_generic_suspend),
++	DEVMETHOD(device_resume, bus_generic_resume),
++	DEVMETHOD(device_shutdown, bus_generic_shutdown),
++	DEVMETHOD(usb_take_controller, ohci_pci_take_controller),
++
++	DEVMETHOD_END
++};
++
++static driver_t ohci_driver = {
++	.name = "ohci",
++	.methods = ohci_pci_methods,
++	.size = sizeof(struct ohci_softc),
++};
++
++DRIVER_MODULE(ohci, pci, ohci_driver, 0, 0);
++MODULE_DEPEND(ohci, usb, 1, 1, 1);
+diff --git a/libbsd.py b/libbsd.py
+index d7a2646d..f2df6708 100644
+--- a/libbsd.py
++++ b/libbsd.py
+@@ -962,6 +962,7 @@ class dev_usb_controller(builder.Module):
+         self.addKernelSpaceSourceFiles(
+             [
+                 'sys/dev/usb/controller/ohci.c',
++                'sys/dev/usb/controller/ohci_pci.c',
+                 'sys/dev/usb/controller/ehci.c',
+                 'sys/dev/usb/controller/ehci_pci.c',
+                 'sys/dev/usb/controller/usb_controller.c',
+@@ -1736,6 +1737,31 @@ class dev_nic_dc(builder.Module):
+             mm.generator['source']()
+         )
+ 
++#
++# Sun GEM/Apple GMAC Ethernet
++#
++class dev_nic_gem(builder.Module):
++
++    def __init__(self, manager):
++        super(dev_nic_gem, self).__init__(manager, type(self).__name__)
++
++    def generate(self):
++        mm = self.manager
++        self.addDependency('fdt')
++        self.addKernelSpaceHeaderFiles(
++            [
++                'sys/dev/gem/if_gemreg.h',
++                'sys/dev/gem/if_gemvar.h',
++            ]
++        )
++        self.addKernelSpaceSourceFiles(
++            [
++                'sys/dev/gem/if_gem.c',
++                'sys/dev/gem/if_gem_pci.c',
++            ],
++            mm.generator['source']()
++        )
++
+ #
+ # SMC9111x
+ #
+@@ -6040,6 +6066,7 @@ def load(mm):
+     mm.addModule(dev_nic_e1000(mm))
+     mm.addModule(dev_nic_xilinx(mm))
+     mm.addModule(dev_nic_dc(mm))
++    mm.addModule(dev_nic_gem(mm))
+     mm.addModule(dev_nic_smc(mm))
+     mm.addModule(dev_nic_broadcomm(mm))
+ 
+diff --git a/rtemsbsd/include/bsp/nexus-devices.h b/rtemsbsd/include/bsp/nexus-devices.h
+index 20887119..e2976506 100644
+--- a/rtemsbsd/include/bsp/nexus-devices.h
++++ b/rtemsbsd/include/bsp/nexus-devices.h
+@@ -303,6 +303,22 @@ RTEMS_BSD_DRIVER_PCI_DC;
+ RTEMS_BSD_DRIVER_PCI_FXP;
+ RTEMS_BSD_DRIVER_UKPHY;
+ 
++#elif defined(LIBBSP_POWERPC_IBOOKG3_BSP_H)
++
++/*
++ * The UniNorth host bridge is enumerated through the legacy pcib, which
++ * reads configuration space through the BSP's libpci access functions.
++ * The BSP seeds each device's interrupt line register with its OpenPIC
++ * source, so the drivers only have to read it back.
++ */
++RTEMS_BSD_DRIVER_PC_LEGACY;
++RTEMS_BSD_DRIVER_PCI_GEM;
++RTEMS_BSD_DRIVER_UKPHY;
++SYSINIT_DRIVER_REFERENCE(ohci, pci);
++SYSINIT_DRIVER_REFERENCE(usbus, ohci);
++RTEMS_BSD_DRIVER_USB;
++RTEMS_BSD_DRIVER_USB_MASS;
++
+ #elif defined(LIBBSP_MICROBLAZE_FPGA_BSP_H)
+ 
+ RTEMS_BSD_DEFINE_NEXUS_DEVICE(ofwbus, 0, 0, NULL);
+diff --git a/rtemsbsd/include/machine/rtems-bsd-nexus-bus.h b/rtemsbsd/include/machine/rtems-bsd-nexus-bus.h
+index 9aa8e7e8..5f9dd017 100644
+--- a/rtemsbsd/include/machine/rtems-bsd-nexus-bus.h
++++ b/rtemsbsd/include/machine/rtems-bsd-nexus-bus.h
+@@ -592,6 +592,15 @@ extern "C" {
+     SYSINIT_DRIVER_REFERENCE(fxp, pci);
+ #endif /* RTEMS_BSD_DRIVER_PCI_FXP */
+ 
++/*
++ * Sun GEM/Apple GMAC Driver
++ */
++#if !defined(RTEMS_BSD_DRIVER_PCI_GEM)
++  #define RTEMS_BSD_DRIVER_PCI_GEM                \
++    SYSINIT_DRIVER_REFERENCE(gem, pci);           \
++    SYSINIT_DRIVER_REFERENCE(miibus, gem);
++#endif /* RTEMS_BSD_DRIVER_PCI_GEM */
++
+ /**
+  ** MMI Physical Layer Support.
+  **/
+-- 
+2.55.0
+

@@ -1,0 +1,42 @@
+From 517c0e38e1c1baf6651c5a60da2399532618e98c Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Fri, 9 Oct 2026 15:03:23 -0700
+Subject: [PATCH 05/15] bsps/powerpc/ibookg3: Correct the gem reset note
+
+The reset failures came from the FreeBSD gem driver writing the reset
+to the interrupt mask register.  Only the receiver and transmitter
+reset messages remain on QEMU, whose sungem model does not clear those
+reset bits.
+---
+ bsps/powerpc/ibookg3/README.md | 15 ++++++++-------
+ 1 file changed, 8 insertions(+), 7 deletions(-)
+
+diff --git a/bsps/powerpc/ibookg3/README.md b/bsps/powerpc/ibookg3/README.md
+index f5b000a0c4c..2e0ed1a653e 100644
+--- a/bsps/powerpc/ibookg3/README.md
++++ b/bsps/powerpc/ibookg3/README.md
+@@ -38,13 +38,14 @@ which selects BSD bus resource activation for the PCI space.
+ Notes for QEMU
+ --------------
+ 
+-* QEMU's sungem model only performs the software reset side effect on
+-  its private `GREG_SWRST` register at offset `0x1010`; the FreeBSD
+-  driver's reset write to `GEM_RESET` (`0x0010`) lands in the backing
+-  store without resetting, so those bits never self-clear and the
+-  driver prints `cannot reset receiver/transmitter` while the device
+-  still works. On real hardware `GEM_RESET` self-clears and the
+-  messages do not appear.
++* The FreeBSD gem driver in rtems-libbsd `6-freebsd-14` writes its
++  software reset to offset `0x0010` (the interrupt mask) instead of the
++  reset register at `0x1010`, a FreeBSD 14 regression; the workbench's
++  libbsd branch fixes it. With the fix the full reset completes.
++* QEMU's sungem model does not clear the reset bit after a receiver-only
++  or transmitter-only reset (it does after a full reset), so the driver
++  still prints `cannot reset receiver` and `cannot reset transmitter` on
++  QEMU. The device works regardless; real hardware clears the bits.
+ 
+ Memory layout: the image is linked to run at 16 MiB (`0x01000000`) with load
+ addresses starting at zero, which is what QEMU's `mac99` `-kernel` loader
+-- 
+2.55.0
+

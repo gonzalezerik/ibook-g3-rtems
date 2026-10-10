@@ -1,0 +1,43 @@
+From ced21ad38ec62c5c42445d5a60da808f923295c0 Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Mon, 5 Oct 2026 16:10:23 -0700
+Subject: [PATCH 01/15] bsps/powerpc: Clear reservation in exception wrapper
+
+Clear the reservation before the return from an exception in the
+classic exception wrapper, like it is done in the fast path for the
+asynchronous exceptions (ppc_exc_async_normal.S).  Otherwise, a
+compare-and-swap sequence interrupted right before its stwcx. may
+succeed with a reservation obtained by the exception handler, after the
+handler changed the value.
+
+No failure has been traced to this.  Uniprocessor builds implement the
+RTEMS atomic operations by disabling interrupts, so only code using
+lwarx/stwcx. directly or through compiler builtins can be affected.
+---
+ bsps/powerpc/shared/exceptions/ppc_exc_asm_macros.h | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/bsps/powerpc/shared/exceptions/ppc_exc_asm_macros.h b/bsps/powerpc/shared/exceptions/ppc_exc_asm_macros.h
+index c89046619b2..dace5ec8e82 100644
+--- a/bsps/powerpc/shared/exceptions/ppc_exc_asm_macros.h
++++ b/bsps/powerpc/shared/exceptions/ppc_exc_asm_macros.h
+@@ -839,6 +839,16 @@ wrap_restore_msr_done_\_FLVR:
+ 	mtxer	SCRATCH_REGISTER_0
+ 	mtctr	SCRATCH_REGISTER_1
+ 
++	/*
++	 * Clear the reservation, otherwise compare-and-swap sequences of the
++	 * interrupted context may use a reservation of the exception handler,
++	 * see ppc_exc_async_normal.S.  The store writes back the saved CR, so it
++	 * does not matter if it succeeds.
++	 */
++	lwz	SCRATCH_REGISTER_0, EXC_CR_OFFSET(r1)
++	li	SCRATCH_REGISTER_1, EXC_CR_OFFSET
++	stwcx.	SCRATCH_REGISTER_0, r1, SCRATCH_REGISTER_1
++
+ 	/* Restore CR and LR */
+ 	lwz	SCRATCH_REGISTER_0, EXC_CR_OFFSET(r1)
+ 	lwz	SCRATCH_REGISTER_1, EXC_LR_OFFSET(r1)
+-- 
+2.55.0
+

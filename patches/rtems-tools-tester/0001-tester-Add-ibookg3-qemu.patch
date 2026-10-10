@@ -1,0 +1,86 @@
+From 449c2aced0161dfb498145ae51a4105c67e96039 Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Mon, 5 Oct 2026 16:10:41 -0700
+Subject: [PATCH] tester: Add ibookg3-qemu
+
+Allow a BSP configuration to name the QEMU command with bsp_qemu_cmd.
+The QEMU system emulator for 32-bit PowerPC is qemu-system-ppc, which
+does not follow the qemu-system-%{bsp_arch} pattern.
+
+Add the configuration for the ibookg3 BSP on QEMU's mac99 machine. Its
+console is the first serial port.
+---
+ tester/rtems/testing/bsps/ibookg3-qemu.ini | 43 ++++++++++++++++++++++
+ tester/rtems/testing/qemu.cfg              |  6 ++-
+ 2 files changed, 48 insertions(+), 1 deletion(-)
+ create mode 100644 tester/rtems/testing/bsps/ibookg3-qemu.ini
+
+diff --git a/tester/rtems/testing/bsps/ibookg3-qemu.ini b/tester/rtems/testing/bsps/ibookg3-qemu.ini
+new file mode 100644
+index 0000000..47533ba
+--- /dev/null
++++ b/tester/rtems/testing/bsps/ibookg3-qemu.ini
+@@ -0,0 +1,43 @@
++#
++# RTEMS Tools Project (http://www.rtems.org/)
++# Copyright 2026 Erik Gonzalez
++# All rights reserved.
++#
++# This file is part of the RTEMS Tools package in 'rtems-tools'.
++#
++# Redistribution and use in source and binary forms, with or without
++# modification, are permitted provided that the following conditions are met:
++#
++# 1. Redistributions of source code must retain the above copyright notice,
++# this list of conditions and the following disclaimer.
++#
++# 2. Redistributions in binary form must reproduce the above copyright notice,
++# this list of conditions and the following disclaimer in the documentation
++# and/or other materials provided with the distribution.
++#
++# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
++# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++# POSSIBILITY OF SUCH DAMAGE.
++#
++
++#
++# The Leon 3 QEMU BSP
++#
++#
++# The Apple iBook G3 BSP on QEMU's mac99 machine with a PowerPC 750CX and
++# 128 MiB of RAM. The console is the first serial port (ESCC channel A).
++#
++[ibookg3-qemu]
++bsp           = ibookg3
++arch          = powerpc
++tester        = %{_rtscripts}/qemu.cfg
++bsp_qemu_cmd  = qemu-system-ppc
++bsp_qemu_opts = %{qemu_opts_base} -monitor none -serial stdio %{qemu_opts_no_net} -M mac99 -cpu 750cx -m 128
+diff --git a/tester/rtems/testing/qemu.cfg b/tester/rtems/testing/qemu.cfg
+index 1b7d4aa..a514866 100644
+--- a/tester/rtems/testing/qemu.cfg
++++ b/tester/rtems/testing/qemu.cfg
+@@ -85,7 +85,11 @@
+  %define bsp_qemu_image_path %{test_executable}
+ %endif
+ 
+-%define qemu_cmd  qemu-system-%{bsp_arch}
++%ifn %{defined bsp_qemu_cmd}
++ %define bsp_qemu_cmd qemu-system-%{bsp_arch}
++%endif
++
++%define qemu_cmd  %{bsp_qemu_cmd}
+ %define qemu_opts %{bsp_qemu_opts} %{bsp_qemu_cov_opts}
+ 
+ #
+-- 
+2.55.0
+

@@ -1,0 +1,42 @@
+From af36623794d18c64fd7ca9324f99cd505992a33c Mon Sep 17 00:00:00 2001
+From: Sebastian Huber <sebastian.huber@embedded-brains.de>
+Date: Wed, 2 Sep 2026 13:31:07 +0200
+Subject: [PATCH 13/15] psxtests/psx09: Use a scheduler which exists
+
+The test asked for the scheduler of processor 1.  A uniprocessor
+configuration owns processor 0 alone.
+rtems_scheduler_ident_by_processor() therefore returned
+RTEMS_INVALID_NAME and the test ended with a failed assertion.
+
+Ask for the scheduler of the last processor of the configuration.  The
+directive under test refuses a scheduler change of a sporadic server
+thread whatever the scheduler is.
+
+Closes #5788.
+
+Assisted-by: Claude:claude-opus-5 claude-code
+Signed-off-by: Sebastian Huber <sebastian.huber@embedded-brains.de>
+(cherry picked from commit c0ccc65b4df4e5bbf82c115889584f38d45ad21f)
+---
+ testsuites/psxtests/psx09/init.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/testsuites/psxtests/psx09/init.c b/testsuites/psxtests/psx09/init.c
+index 20cb5cf7d83..273748eeb31 100644
+--- a/testsuites/psxtests/psx09/init.c
++++ b/testsuites/psxtests/psx09/init.c
+@@ -338,7 +338,10 @@ void *POSIX_Init(
+ 
+   puts( "Init: Go into low priority and set scheduler" );
+ 
+-  sc = rtems_scheduler_ident_by_processor( 1, &scheduler_id );
++  sc = rtems_scheduler_ident_by_processor(
++    rtems_scheduler_get_processor_maximum() - 1,
++    &scheduler_id
++  );
+   rtems_test_assert( sc == RTEMS_SUCCESSFUL );
+ 
+   schedparam.sched_priority = high_priority;
+-- 
+2.55.0
+

@@ -1,0 +1,122 @@
+From 320699ef04f514a0012329b1e2e59d147649435a Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Fri, 9 Oct 2026 22:52:03 -0700
+Subject: [PATCH 09/15] bsps/powerpc/ibookg3: Map RAM above 256 MiB
+
+A BAT maps at most 256 MiB on the 750, and the other data BATs are in
+use, so RAM above 256 MiB was unmapped and the first access to it
+faulted.  The iBook takes up to 640 MiB.  Map the RAM above the BAT
+one-to-one through a page table, placed in the unused RAM below the
+image so that it costs no work area.
+---
+ bsps/powerpc/ibookg3/start/bspstart.c | 61 +++++++++++++++++++++++++--
+ 1 file changed, 58 insertions(+), 3 deletions(-)
+
+diff --git a/bsps/powerpc/ibookg3/start/bspstart.c b/bsps/powerpc/ibookg3/start/bspstart.c
+index 376c63e8a92..5d534c2905a 100644
+--- a/bsps/powerpc/ibookg3/start/bspstart.c
++++ b/bsps/powerpc/ibookg3/start/bspstart.c
+@@ -44,6 +44,7 @@
+ #include <rtems/powerpc/powerpc.h>
+ 
+ #include <libcpu/bat.h>
++#include <libcpu/pte121.h>
+ #include <libcpu/cpuIdent.h>
+ #include <libcpu/spr.h>
+ 
+@@ -59,17 +60,69 @@ uint32_t _CPU_Counter_frequency(void)
+ }
+ 
+ /* BAT size: smallest power of two from 128 KiB to 256 MiB covering size */
++/* Largest block a BAT maps on the 750 */
++#define IBOOKG3_BAT_MAX (256 * 1024 * 1024)
++
++/* RAM below the image, unused except for the exception vectors */
++#define IBOOKG3_LOW_RAM_END 0x01000000
++#define IBOOKG3_VECTORS_END 0x4000
++
+ static uint32_t bat_size(uint32_t size)
+ {
+   uint32_t bat = 128 * 1024;
+ 
+-  while (bat < size && bat < 256 * 1024 * 1024) {
++  while (bat < size && bat < IBOOKG3_BAT_MAX) {
+     bat <<= 1;
+   }
+ 
+   return bat;
+ }
+ 
++/*
++ * DBAT0 maps at most 256 MiB of RAM and the other data BATs are taken by
++ * the I/O space, the PCI host bridge and the frame buffer. RAM above
++ * 256 MiB (the iBook takes more with a SO-DIMM) is mapped one-to-one
++ * through a page table, which lives in the unused RAM below the image.
++ * Call with translation off.
++ */
++static void map_ram_above_bat(uintptr_t ram_end)
++{
++  Triv121PgTbl pt;
++  unsigned ld_size;
++  uintptr_t base;
++  long rc;
++
++  if (ram_end <= IBOOKG3_BAT_MAX) {
++    return;
++  }
++
++  ld_size = triv121PgTblLdMinSize(ram_end);
++  base = IBOOKG3_LOW_RAM_END - (1UL << ld_size);
++  if (base < IBOOKG3_VECTORS_END) {
++    rtems_panic("iBook G3: no room for a page table for %lu MiB of RAM\n",
++      (unsigned long) (ram_end / (1024 * 1024)));
++  }
++
++  pt = triv121PgTblInit(base, ld_size);
++  if (pt == NULL) {
++    rtems_panic("iBook G3: page table setup failed\n");
++  }
++
++  rc = triv121PgTblMap(
++    pt,
++    TRIV121_121_VSID,
++    IBOOKG3_BAT_MAX,
++    (ram_end - IBOOKG3_BAT_MAX) >> 12,
++    0,
++    TRIV121_PP_RW_PAGE
++  );
++  if (rc != TRIV121_MAP_SUCCESS) {
++    rtems_panic("iBook G3: cannot map RAM page %ld\n", rc);
++  }
++
++  triv121PgTblActivate(pt);
++}
++
+ void bsp_start(void)
+ {
+   uintptr_t ram_end = ibookg3_memory_size;
+@@ -93,7 +146,7 @@ void bsp_start(void)
+    */
+   setdbat(0, 0, 0, bat_size(ram_end), _PAGE_RW);
+   setibat(0, 0, 0, bat_size(ram_end), 0);
+-  setdbat(1, io, io, 256 * 1024 * 1024, IO_PAGE);
++  setdbat(1, io, io, IBOOKG3_BAT_MAX, IO_PAGE);
+   setdbat(
+     2,
+     ibookg3_uninorth_base,
+@@ -113,9 +166,11 @@ void bsp_start(void)
+   ) {
+     uintptr_t fb_block = ibookg3_fb.base & 0xf0000000;
+ 
+-    setdbat(3, fb_block, fb_block, 256 * 1024 * 1024, IO_PAGE);
++    setdbat(3, fb_block, fb_block, IBOOKG3_BAT_MAX, IO_PAGE);
+   }
+ 
++  map_ram_above_bat(ram_end);
++
+   _write_MSR(_read_MSR() | MSR_DR | MSR_IR);
+   __asm__ volatile("sync; isync");
+ 
+-- 
+2.55.0
+

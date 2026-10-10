@@ -1,0 +1,44 @@
+From 0b51ab8f39d11db05f6477cfe4594a5863e2903a Mon Sep 17 00:00:00 2001
+From: Sebastian Huber <sebastian.huber@embedded-brains.de>
+Date: Wed, 2 Sep 2026 13:31:07 +0200
+Subject: [PATCH 15/15] score: Inhibit a scheduler change without SMP
+
+The POSIX sporadic server takes the real priority node of a thread out
+of the priority aggregation while the thread runs at the low priority.
+_Scheduler_Set() extracts that node without a check.  It skips the
+extract where a scheduler change inhibitor is present, and only an SMP
+build had one.  A uniprocessor build with the POSIX API therefore
+extracted a node which sits in no tree.  A debug build ended psx09 with
+a failed assertion in _RBTree_Extract() and a release build broke the
+priority aggregation of the thread.
+
+The sporadic server is a property of the POSIX API alone.  Enable the
+scheduler change inhibitors wherever the POSIX API is enabled.
+rtems_task_set_scheduler() then returns RTEMS_RESOURCE_IN_USE for a
+sporadic server thread at both priorities, as it does in an SMP build.
+
+Closes #5745.
+
+Assisted-by: Claude:claude-opus-5 claude-code
+Signed-off-by: Sebastian Huber <sebastian.huber@embedded-brains.de>
+(cherry picked from commit 0e1a26fc0a40f47cebba672936020ef4e0735830)
+---
+ cpukit/include/rtems/score/thread.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/cpukit/include/rtems/score/thread.h b/cpukit/include/rtems/score/thread.h
+index bf143990e45..b34edda163b 100644
+--- a/cpukit/include/rtems/score/thread.h
++++ b/cpukit/include/rtems/score/thread.h
+@@ -112,7 +112,7 @@ extern "C" {
+ #define RTEMS_SCORE_THREAD_REAL_PRIORITY_MAY_BE_INACTIVE
+ #endif
+ 
+-#if defined(RTEMS_POSIX_API) && defined(RTEMS_SMP)
++#if defined(RTEMS_POSIX_API)
+ /**
+  * @brief This define enables support to inhibit scheduler changes.
+  *
+-- 
+2.55.0
+
