@@ -14,7 +14,7 @@ if [ "${HW:-0}" = 1 ]; then
   OUT=app-$BSP-hw.elf
   EXTRA=-Wl,--defsym=IBOOKG3_LOAD_BASE=0x01000000
 fi
-exec nix shell nixpkgs#pkg-config -c bash -c "
+exec "$ROOT/tools/with.sh" pkg-config -- bash -c "
   export PATH=$P/bin:\$PATH PKG_CONFIG_PATH=$P/lib/pkgconfig
   powerpc-rtems6-gcc \$(pkg-config --cflags powerpc-rtems6-$BSP) -O2 -g -Wall \
     *.c \$(pkg-config --libs powerpc-rtems6-$BSP) $EXTRA -o $OUT

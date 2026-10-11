@@ -11,12 +11,12 @@ IMG=disk-data.img
 if [ ! -f "$IMG" ]; then
   echo "creating $IMG"
   dd if=/dev/zero of="$IMG" bs=1M count=16 status=none
-  nix shell nixpkgs#dosfstools -c mkfs.fat -n RTEMSTEST "$IMG"
+  "$ROOT/tools/with.sh" dosfstools -- mkfs.fat -n RTEMSTEST "$IMG"
 fi
 
 # Fresh host file every run so the guest always has something to read
 # and the leftover guest file from the previous run disappears.
-nix shell nixpkgs#mtools -c bash -c "
+"$ROOT/tools/with.sh" mtools -- bash -c "
   echo 'hello from host' > hostfile.txt
   mdel -i $IMG ::hostfile.txt 2>/dev/null || true
   mdel -i $IMG ::rtems-wrote.txt 2>/dev/null || true

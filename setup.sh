@@ -18,12 +18,11 @@ cd "$ROOT/src"
 apply() {
   local dir=$1 series=$2 branch=$3 base=$4
   git -C "$dir" switch -q -c "$branch" "$base"
-  # git am records a committer; give the clone one if none is configured
-  git -C "$dir" config user.email >/dev/null ||
-    git -C "$dir" config user.email "setup@localhost"
-  git -C "$dir" config user.name >/dev/null ||
-    git -C "$dir" config user.name "ibook-g3-rtems setup"
-  git -C "$dir" am -q "$ROOT"/patches/"$series"/*.patch
+  # a fixed committer and the author dates make the commit hashes (which
+  # RTEMS prints at boot) the same on every machine
+  GIT_COMMITTER_NAME="ibook-g3-rtems setup" GIT_COMMITTER_EMAIL=setup@localhost \
+    git -C "$dir" am -q --committer-date-is-author-date \
+    "$ROOT"/patches/"$series"/*.patch
   echo "$dir: $branch ($(ls "$ROOT/patches/$series" | wc -l) patches on ${base:0:12})"
 }
 

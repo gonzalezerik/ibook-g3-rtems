@@ -4,6 +4,7 @@
 # RAM matches Perseverance rover's main computer: the RAD750 has 128 MB DRAM
 # (per Wikipedia's Perseverance article; the same 750-family CPU the iBook uses).
 # Override with e.g.  MEM=256 ./run-g3.sh
+# AUDIO=none to run without PipeWire, DISPLAY_OPT=vnc=0.0.0.0:0 for a VNC screen.
 #
 # Modes:
 #   ./run-g3.sh                 boot the disk image (disk/g3.qcow2) via Open Firmware
@@ -27,7 +28,7 @@ ARGS=(
   -cpu "$CPU"
   -m "$MEM"
   -prom-env 'auto-boot?=true'
-  -audiodev pipewire,id=snd0
+  -audiodev "${AUDIO:-pipewire},id=snd0"   # AUDIO=none where there is no PipeWire
   -device es1370,audiodev=snd0       # no Screamer in mainline QEMU; ES1370 is driven by OS 9/X + Linux PPC
   -device usb-kbd -device usb-mouse   # on mac99's built-in Apple OHCI, like the real iBook
 )
@@ -71,21 +72,21 @@ run_rtems() {
   done
   sleep 1
   if kill -0 "$pid" 2>/dev/null; then
-    python3 - "$mon" "$tmp/screen.ppm" <<'PY'
+    python3 - "$mon" "$tmp/screen.png" <<'PY'
 import socket, sys, time
 s = socket.socket(socket.AF_UNIX)
 s.connect(sys.argv[1])
 time.sleep(0.3)
 s.recv(4096)
-s.sendall(b"screendump " + sys.argv[2].encode() + b"\n")
+s.sendall(b"screendump " + sys.argv[2].encode() + b" -f png\n")
 time.sleep(1.5)
 s.close()
 PY
     kill "$pid" 2>/dev/null || true
   fi
   wait "$pid" 2>/dev/null || true
-  if [[ -s "$tmp/screen.ppm" ]]; then
-    nix shell nixpkgs#imagemagick -c magick "$tmp/screen.ppm" "$SCREENSHOT"
+  if [[ -s "$tmp/screen.png" ]]; then
+    cp "$tmp/screen.png" "$SCREENSHOT"
     echo "run-g3: screen saved to $SCREENSHOT" >&2
   else
     echo "run-g3: no screenshot taken" >&2
@@ -120,5 +121,10 @@ fi
 if [[ ${#EXTRA[@]} -eq 0 && ! -f "$DISK" ]]; then
   echo "run-g3: no disk image at $DISK; give -cdrom, -kernel, -of or -rtems" >&2
   exit 2
+fi
+# DISPLAY_OPT=vnc=0.0.0.0:0 shows the screen over VNC instead of in a local
+# window (the Docker image has none); the other modes use the serial console
+if [[ -n "${DISPLAY_OPT:-}" ]]; then
+  EXTRA+=(-display "$DISPLAY_OPT")
 fi
 exec qemu-system-ppc "${ARGS[@]}" "${NET_BASE[@]}" "${EXTRA[@]}"

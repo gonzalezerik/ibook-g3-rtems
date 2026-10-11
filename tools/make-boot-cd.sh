@@ -23,6 +23,6 @@ fi
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 cp "$ELF" "$TMP/rtems.elf"
-nix shell nixpkgs#xorriso -c xorriso -as mkisofs -quiet -r -hfsplus \
+"$ROOT/tools/with.sh" xorriso -- xorriso -as mkisofs -quiet -r -hfsplus \
   -apm-block-size 2048 -V RTEMS -o "$ISO" "$TMP"
 echo "made $ISO (entry $ENTRY): at the Open Firmware prompt, boot cd:3,\\rtems.elf"

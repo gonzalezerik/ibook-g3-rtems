@@ -26,7 +26,7 @@ rm -f "$LOG" "$MON"
 PART_OFFSET=$((1024 * 1024))
 rm -f "$DISK"
 truncate -s 16M "$DISK"
-nix shell nixpkgs#util-linux nixpkgs#dosfstools nixpkgs#mtools -c bash -c "
+"$ROOT/tools/with.sh" util-linux dosfstools mtools -- bash -c "
   set -euo pipefail
   echo 'start=2048, type=0c' | sfdisk -q $DISK
   mkfs.fat -n USBDEMO --offset 2048 $DISK \$(( (16 * 1024 - 1024) )) >/dev/null
@@ -84,8 +84,8 @@ wait $QEMU 2>/dev/null || true
 rm -f "$MON"
 
 # What the guest wrote, read back on the host, and a check of the volume.
-WROTE=$(nix shell nixpkgs#mtools -c mtype -i "$DISK@@$PART_OFFSET" ::usb-wrote.txt 2>/dev/null || true)
-FSCK=$(nix shell nixpkgs#dosfstools nixpkgs#util-linux -c bash -c "
+WROTE=$("$ROOT/tools/with.sh" mtools -- mtype -i "$DISK@@$PART_OFFSET" ::usb-wrote.txt 2>/dev/null || true)
+FSCK=$("$ROOT/tools/with.sh" dosfstools -- bash -c "
   dev=\$(mktemp); dd if=$DISK of=\$dev bs=1M skip=1 status=none
   fsck.fat -n \$dev >/dev/null 2>&1 && echo clean || echo dirty; rm -f \$dev")
 echo "host: usb-wrote.txt contains: ${WROTE:-<missing>}"

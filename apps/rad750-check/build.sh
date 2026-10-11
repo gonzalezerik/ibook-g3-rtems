@@ -10,7 +10,7 @@ P=$ROOT/rtems
 BSPLIB=$P/powerpc-rtems6/$BSP/lib
 export PATH=$P/bin:$PATH
 export PKG_CONFIG_PATH=$P/lib/pkgconfig
-pkg-config() { nix shell nixpkgs#pkg-config -c pkg-config "$@"; }
+pkg-config() { "$ROOT/tools/with.sh" pkg-config -- pkg-config "$@"; }
 CFLAGS=$(pkg-config --cflags powerpc-rtems6-$BSP)
 LDFLAGS=$(pkg-config --libs powerpc-rtems6-$BSP)
 OUT=rad750-check-$BSP.exe

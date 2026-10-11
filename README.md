@@ -11,9 +11,70 @@ the CPU at 900 MHz, a 100 MHz bus, a 25 MHz timebase, 128 MiB of RAM and an
 800x600 32-bit display, then "Hello from RTEMS on PowerPC", tick 0 to tick 2
 and the RTEMS shutdown report.](docs/screenshots/starter.png)
 
-## Set up
+## Docker (any Linux distribution, Windows, macOS)
 
-Needs Nix (developed on NixOS) and QEMU with `qemu-system-ppc`.
+The image holds everything: the toolchain, the `ibookg3` and `psim` BSPs,
+rtems-libbsd, QEMU and this repository at `/ibook`. It runs wherever Docker
+or Podman does: on Linux, on Windows and macOS through Docker Desktop, on
+x86-64 and ARM64 (Apple Silicon) alike. QEMU emulates the iBook in
+software, so no KVM or other device access is needed.
+
+```sh
+docker pull ghcr.io/gonzalezerik/ibook-g3-rtems
+docker run --rm -it ghcr.io/gonzalezerik/ibook-g3-rtems \
+  bash -c "apps/starter/build.sh && apps/starter/run.sh"
+```
+
+The commands under Develop, Hardware demos, Booting like the real iBook and
+Emulator work the same inside the container: give them to
+`docker run --rm -it IMAGE …`, or start a shell with
+`docker run --rm -it IMAGE` and run them there. Ctrl-A x quits the emulator.
+The image holds the installed BSPs, not the RTEMS sources; to change the BSP
+itself, set up natively (below).
+
+Your own program, kept on the host:
+
+```sh
+# Linux, macOS (bash, zsh)
+mkdir myapp
+docker run --rm -it -v "$PWD/myapp:/ibook/apps/myapp" --user "$(id -u):$(id -g)" \
+  ghcr.io/gonzalezerik/ibook-g3-rtems cp -r apps/starter/. apps/myapp/
+docker run --rm -it -v "$PWD/myapp:/ibook/apps/myapp" --user "$(id -u):$(id -g)" \
+  ghcr.io/gonzalezerik/ibook-g3-rtems bash -c "apps/myapp/build.sh && apps/myapp/run.sh"
+```
+
+```powershell
+# Windows (PowerShell)
+mkdir myapp
+docker run --rm -it -v "${PWD}\myapp:/ibook/apps/myapp" `
+  ghcr.io/gonzalezerik/ibook-g3-rtems cp -r apps/starter/. apps/myapp/
+docker run --rm -it -v "${PWD}\myapp:/ibook/apps/myapp" `
+  ghcr.io/gonzalezerik/ibook-g3-rtems bash -c "apps/myapp/build.sh && apps/myapp/run.sh"
+```
+
+Screenshots land next to your program with
+`-e SCREENSHOT=apps/myapp/shot.png`. The graphical mode of `run-g3.sh` (a
+guest OS of your own, mounted at `/ibook/disk/g3.qcow2`) shows its screen
+over VNC: add `-p 5900:5900` and connect a VNC viewer to `localhost:5900`.
+
+To build the image yourself (about an hour; the toolchain is built from
+source), from a clone of this repository:
+
+```sh
+docker build -t ibook-g3-rtems .
+docker build --target testsuite -t ibook-g3-rtems:testsuite .   # + the RTEMS test suite
+docker run --rm -it ibook-g3-rtems:testsuite \
+  tools/run-testsuite.py --icount build/powerpc/ibookg3/testsuites /tmp/results
+```
+
+On Windows, clone with Git's default settings; `.gitattributes` keeps the
+scripts' line endings as Linux needs them.
+
+## Set up natively
+
+Developed on NixOS; other Linux distributions work too. Needs QEMU
+(`qemu-system-ppc`) and either Nix or the tools the scripts use (the
+Dockerfile lists them for Debian).
 
 ```sh
 ./setup.sh                 # clone RTEMS, rtems-libbsd, rtems-tools and the RSB

@@ -1,0 +1,5 @@
+# keep LF line endings in a Windows checkout: the scripts run in Linux
+# (the Docker image) and git am needs the patches byte for byte
+* text=auto eol=lf
+*.png binary
+*.patch -text

@@ -1,0 +1,12 @@
+.git
+src
+rtems
+disk
+results
+**/*.exe
+**/*.elf
+**/*.o
+**/*.img
+**/*.iso
+**/*.log
+**/__pycache__
