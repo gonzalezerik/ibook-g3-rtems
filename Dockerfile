@@ -8,12 +8,14 @@
 #
 #   docker build -t ibook-g3-rtems .                     # takes about an hour
 #   docker run --rm -it ibook-g3-rtems bash -c "apps/starter/build.sh && apps/starter/run.sh"
+#   docker run --rm ibook-g3-rtems tools/smoke-test.sh     # every demo, checked
 #   docker build --target testsuite -t ibook-g3-rtems:testsuite .
 
-ARG DEBIAN=debian:trixie-slim
+# pinned by digest for repeatable builds; Dependabot proposes updates
+FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS base
 
 # --- build the toolchain, RTEMS and rtems-libbsd -----------------------------
-FROM ${DEBIAN} AS build
+FROM base AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential bison flex texinfo pax unzip bzip2 xz-utils zstd \
       python3 python3-dev python-is-python3 libncurses-dev zlib1g-dev \
@@ -28,11 +30,12 @@ COPY build-toolchain.sh ./
 RUN ./build-toolchain.sh \
     && rm -rf src/rsb/rtems/build src/rsb/rtems/sources src/rsb/rtems/patches \
               rtems/share/doc rtems/share/info rtems/share/man
-COPY tools tools
+# only what the build uses, so script changes elsewhere keep the cache
+COPY tools/rebuild-all.sh tools/with.sh tools/
 RUN tools/rebuild-all.sh
 
 # --- the workbench: toolchain, BSPs, QEMU, scripts and demos ---------------
-FROM ${DEBIAN} AS runtime
+FROM base AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
       qemu-system-ppc seabios ipxe-qemu qemu-utils python3 libpython3-dev libncurses6 libexpat1 \
       pkg-config mtools dosfstools fdisk xorriso procps \

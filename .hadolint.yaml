@@ -1,0 +1,5 @@
+# Debian drops superseded package versions from its archive, so pinning
+# them (DL3008) would break the build after the next point release. The
+# base image is pinned by digest instead.
+ignored:
+  - DL3008

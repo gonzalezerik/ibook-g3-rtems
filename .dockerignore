@@ -10,3 +10,4 @@ results
 **/*.iso
 **/*.log
 **/__pycache__
+.github
