@@ -1,5 +1,8 @@
 # iBook G3 / RTEMS workbench
 
+[![image](https://github.com/gonzalezerik/ibook-g3-rtems/actions/workflows/image.yml/badge.svg)](https://github.com/gonzalezerik/ibook-g3-rtems/actions/workflows/image.yml)
+[![ci](https://github.com/gonzalezerik/ibook-g3-rtems/actions/workflows/ci.yml/badge.svg)](https://github.com/gonzalezerik/ibook-g3-rtems/actions/workflows/ci.yml)
+
 Emulated Apple iBook G3 (M6497, PowerPC 750CX) with 128 MB of RAM, the same
 amount as the Perseverance rover's RAD750, plus an RTEMS 6.2 PowerPC
 toolchain and an RTEMS BSP (`ibookg3`) for it, with disk, network and USB
@@ -19,11 +22,32 @@ or Podman does: on Linux, on Windows and macOS through Docker Desktop, on
 x86-64 and ARM64 (Apple Silicon) alike. QEMU emulates the iBook in
 software, so no KVM or other device access is needed.
 
+| Host | Runs | Image |
+|---|---|---|
+| Linux, any distribution (glibc or musl), x86-64 | Docker Engine or Podman | `linux/amd64` |
+| Linux, any distribution (glibc or musl), ARM64 | Docker Engine or Podman | `linux/arm64` |
+| macOS on Intel | Docker Desktop (or OrbStack, Colima) | `linux/amd64` |
+| macOS on Apple Silicon | Docker Desktop (or OrbStack, Colima) | `linux/arm64` |
+| Windows x64 | Docker Desktop (WSL 2) | `linux/amd64` |
+| Windows on ARM | Docker Desktop (WSL 2) | `linux/arm64` |
+
+Docker picks the image for the host's architecture by itself, so nothing
+runs under emulation but the iBook. The image brings its own C library,
+so the host's does not matter. Every push builds both images natively on
+GitHub's x86-64 and ARM64 runners and runs all the demos in them; macOS
+and Windows run the same Linux images inside Docker Desktop's VM, but CI
+does not test Docker Desktop itself (GitHub's macOS and Windows runners
+have no Linux containers).
+
 ```sh
 docker pull ghcr.io/gonzalezerik/ibook-g3-rtems
 docker run --rm -it ghcr.io/gonzalezerik/ibook-g3-rtems \
   bash -c "apps/starter/build.sh && apps/starter/run.sh"
+docker run --rm ghcr.io/gonzalezerik/ibook-g3-rtems tools/smoke-test.sh   # every demo, checked
 ```
+
+Tags: `latest` follows `main`, `X.Y.Z` and `X.Y` follow releases, and
+`sha-<commit>` names every published build.
 
 The commands under Develop, Hardware demos, Booting like the real iBook and
 Emulator work the same inside the container: give them to
@@ -72,7 +96,8 @@ scripts' line endings as Linux needs them.
 
 ## Set up natively
 
-Developed on NixOS; other Linux distributions work too. Needs QEMU
+Developed on NixOS; other Linux distributions work too (on macOS and
+Windows, use the Docker image). Needs QEMU
 (`qemu-system-ppc`) and either Nix or the tools the scripts use (the
 Dockerfile lists them for Debian).
 
@@ -189,6 +214,8 @@ background.](docs/screenshots/open-firmware.png)
 | `tools/rebuild-all.sh` | clean rebuild and install of RTEMS and rtems-libbsd |
 | `tools/run-testsuite.py` | run RTEMS tests on the emulated iBook (`--icount`) |
 | `tools/make-boot-cd.sh` | Mac-bootable CD image from an `HW=1` ELF |
+| `tools/smoke-test.sh` | build and run every demo and check its output (what CI runs in the image) |
+| `Dockerfile`, `.github/workflows/` | the image, its build and tests on x86-64 and ARM64, and lint checks |
 | `tester/psim-device-tree-128m` | psim device tree with 128 MB, for `apps/rad750-check` |
 | `results/` | test-suite results at 128 and 512 MB |
 | `docs/screenshots/` | the screenshots in this file |
