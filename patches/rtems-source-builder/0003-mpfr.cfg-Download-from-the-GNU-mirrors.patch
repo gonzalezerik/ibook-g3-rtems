@@ -1,0 +1,31 @@
+From dafe3b641e590bcb36f0447f4a2576c2560ca7a5 Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Fri, 16 Oct 2026 23:34:18 -0700
+Subject: [PATCH] mpfr.cfg: Download from the GNU mirrors
+
+www.mpfr.org is a single server; from some networks it serves the
+tarball at about 13 kB/s and the download stalls before it completes.
+The GNU mirrors carry the same release file (the sha512 in
+devel/mpfr-4.2.1.cfg matches).
+---
+ source-builder/config/mpfr.cfg | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/source-builder/config/mpfr.cfg b/source-builder/config/mpfr.cfg
+index 0c029dac..1669ce1f 100644
+--- a/source-builder/config/mpfr.cfg
++++ b/source-builder/config/mpfr.cfg
+@@ -35,7 +35,9 @@ URL: 	   https://www.mpfr.org/
+ #
+ # Source
+ #
+-%source set mpfr https://www.mpfr.org/mpfr-%{mpfr_version}/mpfr-%{mpfr_version}.tar.bz2
++# The GNU mirror network: www.mpfr.org is a single server that can crawl
++# (about 13 kB/s from some networks), and the release is the same file.
++%source set mpfr https://ftpmirror.gnu.org/gnu/mpfr/mpfr-%{mpfr_version}.tar.bz2
+ 
+ #
+ # Remap the standard package paths
+-- 
+2.55.0
+
