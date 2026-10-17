@@ -1,0 +1,32 @@
+# Static checks of the scripts, the Dockerfile and the workflows. The image
+# workflow builds and runs everything.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: shellcheck
+        run: git ls-files -z '*.sh' | xargs -0 shellcheck --severity=warning
+
+      - name: Python syntax
+        run: python3 -m py_compile tools/run-testsuite.py
+
+      - uses: hadolint/hadolint-action@v3.5.0
+        with:
+          dockerfile: Dockerfile
+
+      - name: actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+          ./actionlint -color
