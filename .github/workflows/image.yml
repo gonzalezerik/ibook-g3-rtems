@@ -31,6 +31,8 @@ env:
 jobs:
   build:
     strategy:
+      # one architecture's failure shouldn't cancel the other's build
+      fail-fast: false
       matrix:
         include:
           - platform: linux/amd64

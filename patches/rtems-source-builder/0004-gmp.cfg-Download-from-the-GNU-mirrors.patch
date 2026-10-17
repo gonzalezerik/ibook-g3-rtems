@@ -1,0 +1,31 @@
+From ee85592d70421d1158a0c12e7ad5786a64507cb6 Mon Sep 17 00:00:00 2001
+From: Erik Gonzalez <dev@gonzalezerik.com>
+Date: Sat, 17 Oct 2026 00:12:03 -0700
+Subject: [PATCH] gmp.cfg: Download from the GNU mirrors
+
+gmplib.org refuses some automated downloads, for example from GitHub
+Actions runners, and the build fails with "all paths have failed".
+The GNU mirrors carry the same release file (the sha512 in
+devel/gmp-6.3.0.cfg matches).
+---
+ source-builder/config/gmp.cfg | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/source-builder/config/gmp.cfg b/source-builder/config/gmp.cfg
+index 7dc8bf1d..c06a45b4 100644
+--- a/source-builder/config/gmp.cfg
++++ b/source-builder/config/gmp.cfg
+@@ -34,7 +34,9 @@ URL: 	   https://gmplib.org/
+ # Allow the user to override the UURL
+ #
+ %if %{!defined gmp_url}
+- %define gmp_url https://gmplib.org/download/gmp
++ # The GNU mirror network: gmplib.org refuses some automated downloads
++ # (GitHub Actions runners), and the release is the same file.
++ %define gmp_url https://ftpmirror.gnu.org/gnu/gmp
+ %endif
+ 
+ #
+-- 
+2.55.0
+
