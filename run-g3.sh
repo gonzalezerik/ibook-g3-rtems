@@ -16,6 +16,8 @@
 #   ./run-g3.sh -rtems-cd x.iso boot an RTEMS CD made by tools/make-boot-cd.sh through
 #                               Open Firmware, the way the real iBook boots it
 #   SCREENSHOT=x.png ./run-g3.sh -rtems ...  also save the emulated screen
+# QEMU options separate their own fields with commas (SC2054 misreads them)
+# shellcheck disable=SC2054
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 

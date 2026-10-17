@@ -42,7 +42,7 @@ QEMU=$!
 # listen socket before sending, and retry the exchange each second in
 # the meantime.
 EXCHANGED=no
-for i in $(seq 1 120); do
+for _ in $(seq 1 120); do
   kill -0 $QEMU 2>/dev/null || break
   grep -q "listening on port 7007" "$LOG" 2>/dev/null || { sleep 1; continue; }
   if python3 -c '
@@ -61,7 +61,7 @@ sys.stdout.write(s.recv(100).decode())
 done
 
 # Let the guest finish the fetch direction and shut down.
-for i in $(seq 1 60); do
+for _ in $(seq 1 60); do
   grep -q "=== done ===" "$LOG" 2>/dev/null && break
   sleep 1
 done

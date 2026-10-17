@@ -48,7 +48,7 @@ QEMU=$!
 # Type "hello" once the guest has the keyboard open, so no keystroke
 # is lost before ukbd is attached and polling.
 TYPED=no
-for i in $(seq 1 120); do
+for _ in $(seq 1 120); do
   kill -0 $QEMU 2>/dev/null || break
   if grep -q "usb-demo: keyboard open" "$LOG" 2>/dev/null; then
     python3 -c '
@@ -71,7 +71,7 @@ done
 echo "host: typed hello over the monitor: $TYPED"
 
 # Let the guest finish and shut down.
-for i in $(seq 1 60); do
+for _ in $(seq 1 60); do
   grep -q "=== done ===" "$LOG" 2>/dev/null && break
   sleep 1
 done

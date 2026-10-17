@@ -14,7 +14,7 @@ pkg-config() { "$ROOT/tools/with.sh" pkg-config -- pkg-config "$@"; }
 CFLAGS=$(pkg-config --cflags powerpc-rtems6-$BSP)
 LDFLAGS=$(pkg-config --libs powerpc-rtems6-$BSP)
 OUT=rad750-check-$BSP.exe
-powerpc-rtems6-gcc $CFLAGS -DBSP_$(echo "$BSP" | tr a-z A-Z) -O2 -Wall -c init.c -o init-$BSP.o
+powerpc-rtems6-gcc $CFLAGS "-DBSP_${BSP^^}" -O2 -Wall -c init.c -o init-$BSP.o
 if [ "$BSP" = psim ]; then
   # swap the BSP's 256 MB linkcmds for ours; linkcmds.base comes from the BSP
   powerpc-rtems6-gcc $CFLAGS init-$BSP.o $LDFLAGS -qnolinkcmds -L"$BSPLIB" -T linkcmds-128m -o $OUT
